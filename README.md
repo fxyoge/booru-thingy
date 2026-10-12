@@ -16,16 +16,11 @@ storage holds originals and previews.
 - Automatic publication with configurable tags and rating on the upload page.
 - Restart-safe background processing, bounded retries, and content deduplication.
 - JPEG, PNG, GIF, WebP, MP4, and WebM originals with generated static previews.
-- A single Docker image; no persistent application filesystem or separate queue.
-
-This is a deliberately small backend, not a full Danbooru implementation. See
-[API coverage](docs/api.md) for supported behavior. Compatibility targets
-Boorusama's Danbooru client.
 
 ## Quick start
 
 Install Docker with Compose. Copy `.env.example` to `.env`, set a long random
-`OWNER_API_KEY`, then run:
+`OWNER_API_KEY`, and replace the database and storage credentials, then run:
 
 ```sh
 docker compose up --build -d
@@ -35,7 +30,7 @@ Open **http://localhost:8080/uploads/new** and sign in with `OWNER_LOGIN` and
 `OWNER_API_KEY`. Uploads publish automatically once processing finishes. Empty
 tags become `tagme`; the default rating is General.
 
-Compose includes PostgreSQL and MinIO for local use. Its database and object
+Compose includes PostgreSQL and SeaweedFS for local use. Its database and object
 store volumes are owned by those services; the application itself is stateless.
 The example S3 public endpoint is `localhost`, so remote clients need it changed
 to an address they can reach.
@@ -50,56 +45,80 @@ Android URL sharing opens `/uploads/new?url=...`; sign in in the browser to
 complete the upload. URL imports accept direct image/video links rather than
 scraping media from websites.
 
-## Bring your own services
+## Usage
 
-Build the image:
+booru-thingy merges configs from these locations in order of highest priority
+to least:
 
-```sh
-docker build -t booru-thingy .
-docker run --rm --env-file .env -p 8080:8080 booru-thingy
+* config override passed a CLI arg e.g. `--listen-addr 0.0.0.0:8080`
+* env vars such as `S3_ENDPOINT`, `S3_BUCKET`...
+* config file passed as a CLI arg `--config path/to/config.toml` (or `BOORU_CONFIG`)
+* current working directory `./config.toml`
+* XDG config location `$XDG_CONFIG_HOME/booru-thingy/config.toml` (or `$HOME/.config/booru-thingy/config.toml`)
+* built-in defaults
+
+See [`config.example.toml`](config.example.toml) for example configuration
+values and documentation.
+
+<!-- BEGIN GENERATED CLI HELP -->
+
+```text
+A small headless booru backend
+
+Usage: booru-thingy [OPTIONS] <COMMAND>
+
+Commands:
+  run      Apply migrations, then run the API and upload workers in one process
+  serve    Serve the API only
+  worker   Run upload workers only
+  migrate  Apply database migrations and exit
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <CONFIG>
+          Merge this TOML file over the discovered files [env: BOORU_CONFIG]
+      --database-url <DATABASE_URL>
+
+      --listen-addr <LISTEN_ADDR>
+          HTTP bind address
+      --base-url <BASE_URL>
+          External HTTP(S) origin, without a path
+      --owner-login <OWNER_LOGIN>
+
+      --owner-api-key <OWNER_API_KEY>
+
+      --s3-endpoint <S3_ENDPOINT>
+
+      --s3-public-endpoint <S3_PUBLIC_ENDPOINT>
+
+      --s3-region <S3_REGION>
+
+      --s3-bucket <S3_BUCKET>
+
+      --aws-access-key-id <AWS_ACCESS_KEY_ID>
+
+      --aws-secret-access-key <AWS_SECRET_ACCESS_KEY>
+
+      --s3-path-style <S3_PATH_STYLE>
+          [possible values: true, false]
+      --media-url-ttl-seconds <MEDIA_URL_TTL_SECONDS>
+
+      --upload-ticket-ttl-seconds <UPLOAD_TICKET_TTL_SECONDS>
+          Signed browser upload ticket lifetime, in seconds
+      --max-upload-bytes <MAX_UPLOAD_BYTES>
+          Maximum total file bytes per upload batch or downloaded URL
+      --worker-concurrency <WORKER_CONCURRENCY>
+          Concurrent workflow steps per worker process
+      --process-timeout-seconds <PROCESS_TIMEOUT_SECONDS>
+          Deadline per workflow step attempt, in seconds
+      --allow-private-source-urls <ALLOW_PRIVATE_SOURCE_URLS>
+          [possible values: true, false]
+      --rust-log <RUST_LOG>
+          Tracing log filter
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
-The database and bucket must already exist. The default command applies embedded
-database migrations, then runs the HTTP server and upload workers. Put your
-preferred HTTPS reverse proxy in front and set `BASE_URL` to its external origin.
-
-Required configuration:
-
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL connection URL |
-| `OWNER_API_KEY` | Owner's API credential |
-| `S3_ENDPOINT` | S3-compatible service endpoint |
-| `S3_BUCKET` | Existing bucket |
-| `AWS_ACCESS_KEY_ID` | Bucket access key |
-| `AWS_SECRET_ACCESS_KEY` | Bucket secret key |
-
-Additional configuration:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `BASE_URL` | `http://localhost:8080` | External origin; browser origin validation and secure cookies |
-| `OWNER_LOGIN` | `owner` | Single owner login |
-| `LISTEN_ADDR` | `0.0.0.0:8080` | HTTP bind address |
-| `S3_REGION` | `us-east-1` | S3 signing region |
-| `S3_PATH_STYLE` | `true` | Path-style rather than virtual-host addressing |
-| `S3_PUBLIC_ENDPOINT` | same as `S3_ENDPOINT` | Client-reachable endpoint for signed media URLs |
-| `MEDIA_URL_TTL_SECONDS` | `3600` | Signed URL lifetime; maximum seven days |
-| `MAX_UPLOAD_BYTES` | `536870912` | Maximum total file bytes per batch / downloaded URL |
-| `WORKER_CONCURRENCY` | `2` | Concurrent processing jobs per worker process |
-| `PROCESS_TIMEOUT_SECONDS` | `300` | Overall processing deadline per item |
-| `ALLOW_PRIVATE_SOURCE_URLS` | `false` | Allow URL imports from private/reserved network addresses |
-| `RUST_LOG` | `booru_thingy=info` | Log filter |
-
-Bucket access needs object read/write/delete and bucket HEAD permission. Media
-objects stay private; clients receive expiring signed GET URLs. The public S3
-endpoint must expose the same bucket with the same addressing mode and region.
-
-### Process modes
-
-```sh
-booru-thingy          # apply schema, serve API, run workers
-booru-thingy migrate  # apply schema and exit
-booru-thingy serve    # API only, schema must already be current
-booru-thingy worker   # workers only, schema must already be current
-```
+<!-- END GENERATED CLI HELP -->

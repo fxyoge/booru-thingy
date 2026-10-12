@@ -1,0 +1,122 @@
+x-app: &app
+  image: booru-thingy:e2e
+  read_only: true
+  tmpfs: ["/tmp:size=256m,uid=10001,gid=10001,mode=1777"]
+  environment: &environment
+    DATABASE_URL: postgres://booru:booru@postgres:5432/booru
+    BASE_URL: http://localhost:8080
+    OWNER_LOGIN: owner
+    OWNER_API_KEY: e2e-test-key
+    S3_ENDPOINT: http://seaweedfs:9000
+    S3_PUBLIC_ENDPOINT: http://localhost:9000
+    S3_REGION: us-east-1
+    S3_BUCKET: e2e
+    AWS_ACCESS_KEY_ID: local-access-key
+    AWS_SECRET_ACCESS_KEY: local-secret-key
+    MAX_UPLOAD_BYTES: "2097152"
+    UPLOAD_TICKET_TTL_SECONDS: "15"
+    ALLOW_PRIVATE_SOURCE_URLS: "true"
+    PROCESS_TIMEOUT_SECONDS: "30"
+    WORKER_CONCURRENCY: "2"
+  depends_on: &dependencies
+    postgres: {condition: service_healthy}
+    bucket-init: {condition: service_completed_successfully}
+    sources: {condition: service_healthy}
+
+services:
+  app:
+    <<: *app
+    command: ["run"]
+    ports: ["127.0.0.1:8080:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/readyz"]
+      interval: 2s
+      timeout: 6s
+      retries: 30
+      start_period: 5s
+
+  migrate:
+    image: booru-thingy:e2e
+    profiles: ["split"]
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: postgres://booru:booru@postgres:5432/booru
+    depends_on:
+      postgres: {condition: service_healthy}
+    read_only: true
+    healthcheck: {disable: true}
+
+  worker:
+    <<: *app
+    profiles: ["split"]
+    command: ["worker"]
+    depends_on:
+      <<: *dependencies
+      migrate: {condition: service_completed_successfully}
+    healthcheck: {disable: true}
+
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: booru
+      POSTGRES_USER: booru
+      POSTGRES_PASSWORD: booru
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booru -d booru"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    command: mini -ip=seaweedfs -s3.port=9000 -s3.autoCreateBucket=false -s3.allowedOrigins=http://localhost:8080 -admin.port=9001
+    environment:
+      AWS_ACCESS_KEY_ID: local-access-key
+      AWS_SECRET_ACCESS_KEY: local-secret-key
+    ports: ["127.0.0.1:9000:9000"]
+    volumes: ["media-data:/data"]
+
+  bucket-init:
+    image: booru-thingy:e2e
+    entrypoint: ["/bin/sh", "-ec"]
+    environment:
+      S3_ENDPOINT: http://seaweedfs:9000
+      S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local-access-key
+      AWS_SECRET_ACCESS_KEY: local-secret-key
+    command:
+      - |
+        s3() {
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 10 \
+            --aws-sigv4 "aws:amz:$${S3_REGION}:s3" --user "$$AWS_ACCESS_KEY_ID:$$AWS_SECRET_ACCESS_KEY" "$$@"
+        }
+        for attempt in $$(seq 1 60); do
+          if s3 --head "$$S3_ENDPOINT/e2e" || s3 -X PUT "$$S3_ENDPOINT/e2e"; then break; fi
+          sleep 1
+        done
+        s3 -X PUT "$$S3_ENDPOINT/e2e?cors" \
+          -H 'Content-Type: application/xml' --data '<CORSConfiguration><CORSRule><AllowedOrigin>http://localhost:8080</AllowedOrigin><AllowedMethod>POST</AllowedMethod><AllowedHeader>*</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>300</MaxAgeSeconds></CORSRule></CORSConfiguration>'
+    depends_on:
+      seaweedfs: {condition: service_started}
+    read_only: true
+    healthcheck: {disable: true}
+
+  sources:
+    image: python:3.13.3-slim-bookworm
+    command: ["python", "-u", "/source_server.py"]
+    volumes: ["./source_server.py:/source_server.py:ro"]
+    ports: ["127.0.0.1:8090:8000"]
+    environment:
+      SOURCE_ORIGIN: http://sources:8000
+      MAX_UPLOAD_BYTES: "2097152"
+    read_only: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
+  media-data:

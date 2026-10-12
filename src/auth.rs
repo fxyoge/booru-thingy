@@ -1,5 +1,6 @@
 use crate::{
     App,
+    db::{generated as queries, optional},
     error::{Error, Result},
 };
 use axum::{
@@ -42,6 +43,14 @@ pub fn cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 pub async fn require_auth(State(app): State<App>, request: Request, next: Next) -> Response {
+    if !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) && request.headers().get(header::ORIGIN).is_some_and(|origin| {
+        origin.to_str().ok() != Some(app.config.base_url.trim_end_matches('/'))
+    }) {
+        return Error(StatusCode::FORBIDDEN, "invalid origin".into()).into_response();
+    }
     let mut authorized = false;
     if let Some(value) = request
         .headers()
@@ -65,12 +74,8 @@ pub async fn require_auth(State(app): State<App>, request: Request, next: Next) 
         }
     }
     if !authorized && let Some(token) = cookie(request.headers()) {
-        let csrf: std::result::Result<Option<String>, _> = sqlx::query_scalar(
-            "SELECT csrf_token FROM web_sessions WHERE token_hash=$1 AND expires_at > now()",
-        )
-        .bind(hash(&token))
-        .fetch_optional(&app.db)
-        .await;
+        let csrf = optional(queries::get_session(&app.db, &hash(&token)).await)
+            .map(|row| row.map(|row| row.csrf_token));
         match csrf {
             Ok(Some(csrf)) => {
                 if !matches!(
@@ -130,8 +135,14 @@ pub async fn login(
     }
     let token = token();
     let csrf = self::token();
-    sqlx::query("INSERT INTO web_sessions(token_hash,csrf_token,expires_at) VALUES ($1,$2,now()+interval '7 days')")
-        .bind(hash(&token)).bind(&csrf).execute(&app.db).await?;
+    queries::create_session(
+        &app.db,
+        queries::CreateSessionParams {
+            token_hash: &hash(&token),
+            csrf_token: &csrf,
+        },
+    )
+    .await?;
     let secure = if app.config.base_url.starts_with("https://") {
         "; Secure"
     } else {
@@ -149,12 +160,7 @@ pub async fn login(
 }
 pub async fn session(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>> {
     let csrf = if let Some(token) = cookie(&headers) {
-        sqlx::query_scalar::<_, String>(
-            "SELECT csrf_token FROM web_sessions WHERE token_hash=$1 AND expires_at>now()",
-        )
-        .bind(hash(&token))
-        .fetch_optional(&app.db)
-        .await?
+        optional(queries::get_session(&app.db, &hash(&token)).await)?.map(|row| row.csrf_token)
     } else {
         None
     };
@@ -164,10 +170,7 @@ pub async fn session(State(app): State<App>, headers: HeaderMap) -> Result<Json<
 }
 pub async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
     if let Some(token) = cookie(&headers) {
-        sqlx::query("DELETE FROM web_sessions WHERE token_hash=$1")
-            .bind(hash(&token))
-            .execute(&app.db)
-            .await?;
+        queries::delete_session(&app.db, &hash(&token)).await?;
     }
     let mut response = Json(json!({"success":true})).into_response();
     response.headers_mut().insert(

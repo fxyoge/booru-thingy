@@ -1,0 +1,47 @@
+x-storage: &storage
+  S3_ENDPOINT: http://garage:3900
+  S3_REGION: garage
+  AWS_ACCESS_KEY_ID: &access_key GK00000000000000000000000000000001
+  AWS_SECRET_ACCESS_KEY: &secret_key '0000000000000000000000000000000000000000000000000000000000000001'
+
+services:
+  app:
+    extends: {file: compose.yaml, service: app}
+    environment: *storage
+
+  postgres:
+    extends: {file: compose.yaml, service: postgres}
+
+  sources:
+    extends: {file: compose.yaml, service: sources}
+
+  bucket-init:
+    extends: {file: compose.yaml, service: bucket-init}
+    environment: *storage
+    depends_on: !override
+      garage: {condition: service_healthy}
+
+  garage:
+    image: dxflrs/garage:v2.4.1
+    entrypoint: ["/garage"]
+    command: ["server", "--single-node", "--default-bucket"]
+    environment:
+      GARAGE_RPC_SECRET: '0000000000000000000000000000000000000000000000000000000000000001'
+      GARAGE_DEFAULT_ACCESS_KEY: *access_key
+      GARAGE_DEFAULT_SECRET_KEY: *secret_key
+      GARAGE_DEFAULT_BUCKET: e2e
+    ports: ["127.0.0.1:9000:3900"]
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage
+    read_only: true
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 2s
+      timeout: 6s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  garage-data:

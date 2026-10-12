@@ -72,7 +72,7 @@ impl Search {
         }
         search
     }
-    pub fn predicates(&self, sql: &mut QueryBuilder<'_, Postgres>, owner: &str) {
+    pub fn predicates(&self, sql: &mut QueryBuilder<Postgres>, owner: &str) {
         sql.push(" WHERE true");
         if self.unsupported {
             sql.push(" AND false");

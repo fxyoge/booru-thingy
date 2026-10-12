@@ -1,5 +1,6 @@
 use crate::{
     App,
+    db::{generated as queries, optional},
     error::{Error, Result},
     search::{Search, escape_like},
 };
@@ -11,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use sqlx::{Postgres, QueryBuilder, Row, Transaction};
+use sqlx::{Postgres, QueryBuilder, Transaction};
 use std::collections::{BTreeSet, HashMap};
 
 pub type Params = HashMap<String, String>;
@@ -176,9 +177,9 @@ pub fn normalize_tags(value: &str) -> Result<BTreeSet<String>> {
 }
 
 pub async fn owner(app: &App) -> Result<Value> {
-    let row = sqlx::query("SELECT s.*, (SELECT count(*) FROM posts) AS uploads, (SELECT count(*) FROM favorites) AS favorites FROM user_settings s WHERE id=1").fetch_one(&app.db).await?;
+    let row = queries::get_owner(&app.db).await?;
     Ok(
-        json!({"id":1,"name":app.config.owner_login,"level":50,"level_string":"Owner","created_at":row.get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,_>("created_at").to_rfc3339(),"updated_at":row.get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,_>("updated_at").to_rfc3339(),"post_upload_count":row.get::<i64,_>("uploads"),"favorite_count":row.get::<i64,_>("favorites"),"post_update_count":0,"note_update_count":0,"comment_count":0,"forum_post_count":0,"blacklisted_tags":row.get::<String,_>("blacklisted_tags"),"can_upload_free":true,"is_banned":false,"is_deleted":false,"show_deleted_children":true}),
+        json!({"id":1,"name":app.config.owner_login,"level":50,"level_string":"Owner","created_at":row.created_at.to_rfc3339(),"updated_at":row.updated_at.to_rfc3339(),"post_upload_count":row.uploads,"favorite_count":row.favorites,"post_update_count":0,"note_update_count":0,"comment_count":0,"forum_post_count":0,"blacklisted_tags":row.blacklisted_tags,"can_upload_free":true,"is_banned":false,"is_deleted":false,"show_deleted_children":true}),
     )
 }
 async fn profile(State(app): State<App>) -> Result<Json<Value>> {
@@ -299,10 +300,7 @@ async fn serialize_post(app: &App, mut post: Value) -> Result<Value> {
     Ok(post)
 }
 pub async fn post_by_id(app: &App, id: i64) -> Result<Value> {
-    let raw: Value = sqlx::query_scalar(&format!("{POST_SELECT} WHERE p.id=$1"))
-        .bind(id)
-        .fetch_one(&app.db)
-        .await?;
+    let raw = queries::get_post(&app.db, id).await?.payload;
     serialize_post(app, raw).await
 }
 async fn show_post(State(app): State<App>, Path(value): Path<String>) -> Result<Json<Value>> {
@@ -359,38 +357,23 @@ pub async fn set_tags(
     post_id: i64,
     tags: &BTreeSet<String>,
 ) -> Result<()> {
-    let current: Vec<String> = sqlx::query_scalar(
-        "SELECT t.name FROM tags t JOIN post_tags pt ON pt.tag_id=t.id WHERE pt.post_id=$1",
-    )
-    .bind(post_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let current: BTreeSet<_> = current.into_iter().collect();
+    let current: BTreeSet<_> = queries::list_post_tags(&mut *tx, post_id)
+        .await?
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
     for name in current.union(tags) {
         if current.contains(name) == tags.contains(name) {
             continue;
         }
-        let tag_id: i64 = sqlx::query_scalar("INSERT INTO tags(name) VALUES ($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING id").bind(name).fetch_one(&mut **tx).await?;
+        let tag_id = queries::upsert_tag(&mut *tx, name).await?.id;
         if tags.contains(name) {
-            sqlx::query("INSERT INTO post_tags(post_id,tag_id) VALUES ($1,$2)")
-                .bind(post_id)
-                .bind(tag_id)
-                .execute(&mut **tx)
-                .await?;
-            sqlx::query("UPDATE tags SET post_count=post_count+1, updated_at=now() WHERE id=$1")
-                .bind(tag_id)
-                .execute(&mut **tx)
-                .await?;
+            queries::add_post_tag(&mut *tx, queries::AddPostTagParams { post_id, tag_id }).await?;
+            queries::increment_tag_count(&mut *tx, tag_id).await?;
         } else {
-            sqlx::query("DELETE FROM post_tags WHERE post_id=$1 AND tag_id=$2")
-                .bind(post_id)
-                .bind(tag_id)
-                .execute(&mut **tx)
+            queries::remove_post_tag(&mut *tx, queries::RemovePostTagParams { post_id, tag_id })
                 .await?;
-            sqlx::query("UPDATE tags SET post_count=post_count-1, updated_at=now() WHERE id=$1")
-                .bind(tag_id)
-                .execute(&mut **tx)
-                .await?;
+            queries::decrement_tag_count(&mut *tx, tag_id).await?;
         }
     }
     Ok(())
@@ -403,25 +386,20 @@ pub async fn publish(
     rating: &str,
 ) -> Result<(i64, bool)> {
     // Serializes publication even when two uploads resolve to the same asset.
-    sqlx::query("SELECT id FROM media_assets WHERE id=$1 AND status='active' FOR UPDATE")
-        .bind(asset_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    if let Some(id) = sqlx::query_scalar::<_, i64>("SELECT id FROM posts WHERE media_asset_id=$1")
-        .bind(asset_id)
-        .fetch_optional(&mut **tx)
-        .await?
-    {
-        return Ok((id, true));
+    queries::lock_active_asset(&mut *tx, asset_id).await?;
+    if let Some(row) = optional(queries::get_post_by_asset(&mut *tx, asset_id).await)? {
+        return Ok((row.id, true));
     }
-    let id = sqlx::query_scalar(
-        "INSERT INTO posts(media_asset_id,source,rating) VALUES ($1,$2,$3) RETURNING id",
+    let id = queries::create_post(
+        &mut *tx,
+        queries::CreatePostParams {
+            media_asset_id: asset_id,
+            source,
+            rating,
+        },
     )
-    .bind(asset_id)
-    .bind(source)
-    .bind(rating)
-    .fetch_one(&mut **tx)
-    .await?;
+    .await?
+    .id;
     set_tags(tx, id, tags).await?;
     Ok((id, false))
 }
@@ -440,13 +418,10 @@ async fn create_post(
         .get("upload_media_asset_id")
         .or_else(|| params.get("post[upload_media_asset_id]"))
     {
-        sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT media_asset_id FROM upload_items WHERE id=$1 AND status='completed'",
-        )
-        .bind(id(value)?)
-        .fetch_one(&app.db)
-        .await?
-        .ok_or_else(|| Error::bad("asset is not ready"))?
+        queries::get_completed_item_asset(&app.db, id(value)?)
+            .await?
+            .media_asset_id
+            .ok_or_else(|| Error::bad("asset is not ready"))?
     } else {
         return Err(Error::bad(
             "media_asset_id or upload_media_asset_id is required",
@@ -474,11 +449,14 @@ async fn create_post(
     )
     .await?;
     if !duplicate && let Some(parent) = params.get("post[parent_id]").filter(|v| !v.is_empty()) {
-        sqlx::query("UPDATE posts SET parent_id=$1 WHERE id=$2")
-            .bind(id(parent)?)
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
+        queries::set_post_parent(
+            &mut tx,
+            queries::SetPostParentParams {
+                parent_id: Some(id(parent)?),
+                id: post_id,
+            },
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(Json(post_by_id(&app, post_id).await?))
@@ -530,24 +508,18 @@ async fn edit_post(
     params.extend(input(&headers, &bytes)?);
     let mut tx = app.db.begin().await?;
     if params.contains_key("post[parent_id]") {
-        sqlx::query("SELECT pg_advisory_xact_lock(109,1)")
-            .execute(&mut *tx)
-            .await?;
+        queries::lock_parent_relationships(&mut tx).await?;
     }
-    sqlx::query("SELECT id FROM posts WHERE id=$1 FOR UPDATE")
-        .bind(post_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    queries::lock_post(&mut tx, post_id).await?;
     let mut selected_rating = params.get("post[rating]").map(String::as_str);
     if let Some(new) = params.get("post[tag_string]") {
-        let current: Vec<String> = sqlx::query_scalar(
-            "SELECT t.name FROM tags t JOIN post_tags pt ON pt.tag_id=t.id WHERE pt.post_id=$1",
-        )
-        .bind(post_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let current = queries::list_post_tags(&mut tx, post_id)
+            .await?
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
         let tags = edit_tags(
-            &current.into_iter().collect(),
+            &current,
             params.get("post[old_tag_string]").map(String::as_str),
             new,
         )?;
@@ -560,18 +532,24 @@ async fn edit_post(
         }
     }
     if let Some(value) = selected_rating {
-        sqlx::query("UPDATE posts SET rating=$1 WHERE id=$2")
-            .bind(rating(value)?)
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
+        queries::set_post_rating(
+            &mut tx,
+            queries::SetPostRatingParams {
+                rating: rating(value)?,
+                id: post_id,
+            },
+        )
+        .await?;
     }
     if let Some(value) = params.get("post[source]") {
-        sqlx::query("UPDATE posts SET source=$1 WHERE id=$2")
-            .bind(value)
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
+        queries::set_post_source(
+            &mut tx,
+            queries::SetPostSourceParams {
+                source: value,
+                id: post_id,
+            },
+        )
+        .await?;
     }
     if let Some(value) = params.get("post[parent_id]") {
         let parent = if value.is_empty() {
@@ -581,21 +559,29 @@ async fn edit_post(
         };
         // Prevent cycles, including indirect ones.
         if let Some(parent) = parent {
-            let cycle: bool = sqlx::query_scalar("WITH RECURSIVE ancestors AS (SELECT id,parent_id FROM posts WHERE id=$1 UNION SELECT p.id,p.parent_id FROM posts p JOIN ancestors a ON p.id=a.parent_id) SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=$2)").bind(parent).bind(post_id).fetch_one(&mut *tx).await?;
+            let cycle = queries::would_create_parent_cycle(
+                &mut tx,
+                queries::WouldCreateParentCycleParams {
+                    id: parent,
+                    post_id,
+                },
+            )
+            .await?
+            .cycle;
             if cycle {
                 return Err(Error::bad("parent relationship would create a cycle"));
             }
         }
-        sqlx::query("UPDATE posts SET parent_id=$1 WHERE id=$2")
-            .bind(parent)
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    sqlx::query("UPDATE posts SET updated_at=now() WHERE id=$1")
-        .bind(post_id)
-        .execute(&mut *tx)
+        queries::set_post_parent(
+            &mut tx,
+            queries::SetPostParentParams {
+                parent_id: parent,
+                id: post_id,
+            },
+        )
         .await?;
+    }
+    queries::touch_post(&mut tx, post_id).await?;
     tx.commit().await?;
     Ok(Json(post_by_id(&app, post_id).await?))
 }
@@ -646,8 +632,17 @@ async fn autocomplete(State(app): State<App>, Query(params): Query<Params>) -> R
     if prefix.is_empty() {
         return Ok(Json(json!([])));
     }
-    let rows: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('type','tag-word','label',name,'value',name,'antecedent',NULL,'category',category,'post_count',post_count,'source','local','has_children',false,'tag',name,'completion',name,'qualified_name',name) FROM tags WHERE name LIKE $1 ORDER BY post_count DESC,name LIMIT $2")
-        .bind(format!("{}%",escape_like(&prefix.to_lowercase()))).bind(limit(&params,20)).fetch_all(&app.db).await?;
+    let rows: Vec<Value> = queries::autocomplete_tags(
+        &app.db,
+        queries::AutocompleteTagsParams {
+            name: &format!("{}%", escape_like(&prefix.to_lowercase())),
+            result_limit: limit(&params, 20),
+        },
+    )
+    .await?
+    .into_iter()
+    .map(|row| row.payload)
+    .collect();
     Ok(Json(json!(rows)))
 }
 async fn related(Query(params): Query<Params>) -> Json<Value> {
@@ -689,22 +684,29 @@ async fn add_favorite(
         .get("post_id")
         .or_else(|| query.get("post_id"))
         .ok_or_else(|| Error::bad("post_id is required"))?)?;
-    let value: Value = sqlx::query_scalar("INSERT INTO favorites(post_id) VALUES ($1) ON CONFLICT(post_id) DO UPDATE SET post_id=EXCLUDED.post_id RETURNING to_jsonb(favorites) || jsonb_build_object('user_id',1)").bind(post_id).fetch_one(&app.db).await?;
+    let value = queries::add_favorite(&app.db, post_id).await?.payload;
     Ok(Json(value))
 }
 async fn delete_favorite(State(app): State<App>, Path(value): Path<String>) -> Result<Json<Value>> {
-    sqlx::query("DELETE FROM favorites WHERE post_id=$1")
-        .bind(id(&value)?)
-        .execute(&app.db)
-        .await?;
+    queries::delete_favorite(&app.db, id(&value)?).await?;
     Ok(Json(json!({"success":true})))
 }
 async fn post_favorites(State(app): State<App>, Path(value): Path<String>) -> Result<Json<Value>> {
-    let rows: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(f) || jsonb_build_object('user_id',1,'user',jsonb_build_object('id',1,'name',$2::text)) FROM favorites f WHERE post_id=$1").bind(id(&value)?).bind(&app.config.owner_login).fetch_all(&app.db).await?;
+    let rows: Vec<Value> = queries::list_post_favorites(
+        &app.db,
+        queries::ListPostFavoritesParams {
+            post_id: id(&value)?,
+            owner_login: &app.config.owner_login,
+        },
+    )
+    .await?
+    .into_iter()
+    .map(|row| row.payload)
+    .collect();
     Ok(Json(json!(rows)))
 }
 pub async fn asset_by_id(app: &App, id: i64) -> Result<Value> {
-    let value: Value = sqlx::query_scalar("SELECT to_jsonb(a) || jsonb_build_object('variants',COALESCE((SELECT jsonb_agg(to_jsonb(v)) FROM media_variants v WHERE v.media_asset_id=a.id),'[]'::jsonb)) FROM media_assets a WHERE id=$1").bind(id).fetch_one(&app.db).await?;
+    let value = queries::get_media_asset(&app.db, id).await?.payload;
     serialize_asset(app, value).await
 }
 async fn assets(State(app): State<App>, Query(params): Query<Params>) -> Result<Json<Value>> {
@@ -714,13 +716,17 @@ async fn assets(State(app): State<App>, Query(params): Query<Params>) -> Result<
             .map(id)
             .collect::<Result<Vec<_>>>()?
     } else {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM media_assets WHERE status='active' ORDER BY id DESC LIMIT $1 OFFSET $2",
+        queries::list_active_asset_ids(
+            &app.db,
+            queries::ListActiveAssetIdsParams {
+                result_limit: limit(&params, 100),
+                result_offset: offset(&params, limit(&params, 100)),
+            },
         )
-        .bind(limit(&params, 100))
-        .bind(offset(&params, limit(&params, 100)))
-        .fetch_all(&app.db)
         .await?
+        .into_iter()
+        .map(|row| row.id)
+        .collect()
     };
     let mut output = Vec::new();
     for id in ids {

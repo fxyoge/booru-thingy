@@ -1,23 +1,23 @@
 use crate::App;
 use md5::Md5;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
 use tokio::{io::AsyncReadExt, process::Command};
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Metadata {
     pub sha256: String,
     pub md5: String,
-    pub ext: &'static str,
-    pub content_type: &'static str,
+    pub ext: String,
+    pub content_type: String,
     pub width: i32,
     pub height: i32,
     pub duration: Option<f64>,
     pub size: i64,
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Variant {
     pub kind: String,
     pub key: String,
@@ -141,8 +141,8 @@ pub async fn inspect(path: &Path) -> anyhow::Result<Metadata> {
     Ok(Metadata {
         sha256: hex::encode(sha.finalize()),
         md5: hex::encode(md5.finalize()),
-        ext,
-        content_type,
+        ext: ext.into(),
+        content_type: content_type.into(),
         width: width as i32,
         height: height as i32,
         duration,
@@ -178,16 +178,13 @@ pub async fn variants(
     directory: &Path,
 ) -> anyhow::Result<Vec<Variant>> {
     let original_key = format!("media/{}/original.{}", metadata.sha256, metadata.ext);
-    app.storage
-        .put(&original_key, input, metadata.content_type)
-        .await?;
     let mut variants = vec![];
     for kind in ["original", "full"] {
         variants.push(Variant {
             kind: kind.into(),
             key: original_key.clone(),
-            ext: metadata.ext.into(),
-            content_type: metadata.content_type.into(),
+            ext: metadata.ext.clone(),
+            content_type: metadata.content_type.clone(),
             width: metadata.width,
             height: metadata.height,
             size: metadata.size,
@@ -195,7 +192,7 @@ pub async fn variants(
     }
     let frame: PathBuf = directory.join("frame.png");
     // libvips loads the first image frame; ffmpeg extracts video poster frames.
-    if matches!(metadata.ext, "mp4" | "webm") {
+    if matches!(metadata.ext.as_str(), "mp4" | "webm") {
         command(
             "ffmpeg",
             &[
@@ -214,7 +211,7 @@ pub async fn variants(
         )
         .await?;
     }
-    let source = if matches!(metadata.ext, "mp4" | "webm") {
+    let source = if matches!(metadata.ext.as_str(), "mp4" | "webm") {
         &frame
     } else {
         input
@@ -228,13 +225,13 @@ pub async fn variants(
         if kind == "sample"
             && (metadata.duration.is_some()
                 || metadata.ext == "gif"
-                || matches!(metadata.ext, "mp4" | "webm"))
+                || matches!(metadata.ext.as_str(), "mp4" | "webm"))
         {
             variants.push(Variant {
                 kind: kind.into(),
                 key: original_key.clone(),
-                ext: metadata.ext.into(),
-                content_type: metadata.content_type.into(),
+                ext: metadata.ext.clone(),
+                content_type: metadata.content_type.clone(),
                 width: metadata.width,
                 height: metadata.height,
                 size: metadata.size,
@@ -280,15 +277,6 @@ pub async fn variants(
     }
     Ok(variants)
 }
-pub async fn with_timeout<T>(
-    seconds: u64,
-    future: impl std::future::Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
-    tokio::time::timeout(Duration::from_secs(seconds), future)
-        .await
-        .map_err(|_| anyhow::anyhow!("processing timed out"))?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

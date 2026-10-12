@@ -1,0 +1,51 @@
+# Config value key names are shared between config formats:
+#              .toml                 /             env var            /             cli arg
+# base_url = "http://localhost:8080" / BASE_URL=http://localhost:8080 / --base-url "http://localhost:8080".
+
+# Required for every process mode.
+database_url = "postgres://booru:booru@localhost:5432/booru"
+
+# Required for the default, serve, and worker modes.
+owner_api_key = "replace-with-a-long-random-key"
+
+# Required storage settings for default, serve, and worker modes.
+s3_endpoint = "http://localhost:9000"
+s3_bucket = "booru"
+aws_access_key_id = "local-access-key"
+aws_secret_access_key = "local-secret-key"
+
+# Optional settings below show built-in defaults unless otherwise noted.
+
+# HTTP bind address.
+listen_addr = "0.0.0.0:8080"
+# External origin, without a path; used for origin validation and secure cookies.
+base_url = "http://localhost:8080"
+# Single owner's login.
+owner_login = "owner"
+
+# S3 signing region.
+s3_region = "us-east-1"
+# Path-style rather than virtual-host addressing.
+s3_path_style = true
+# Optional client-reachable endpoint for downloads and uploads; defaults to s3_endpoint.
+# Must expose the same bucket, addressing mode, and region.
+# Use HTTPS for an HTTPS application; allow browser POSTs from base_url in storage CORS.
+# s3_public_endpoint = "https://media.example.com"
+# Objects stay private; clients receive signed GET URLs. Bucket access needs object
+# read/write/delete and bucket HEAD permission.
+
+# Signed URL lifetime, 1..604800 seconds.
+media_url_ttl_seconds = 3600
+# Browser upload capability lifetime, 1..3600 seconds; unrelated to media GET URLs.
+upload_ticket_ttl_seconds = 900
+# Maximum total file bytes per batch / downloaded URL, 1 byte..5 GiB.
+max_upload_bytes = 536870912
+# Concurrent workflow steps per worker process, 1..32.
+worker_concurrency = 2
+# Deadline per workflow step attempt, positive seconds.
+process_timeout_seconds = 300
+# Allow URL imports from private/reserved addresses.
+allow_private_source_urls = false
+
+# Tracing log filter.
+rust_log = "booru_thingy=info"

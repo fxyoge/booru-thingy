@@ -82,27 +82,17 @@ CREATE TABLE upload_items (
     filename text NOT NULL DEFAULT '',
     source_url text NOT NULL DEFAULT '',
     staging_key text,
+    original_key text,
+    run_id text,
     media_asset_id bigint REFERENCES media_assets(id),
     post_id bigint REFERENCES posts(id),
-    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('receiving', 'pending', 'processing', 'completed', 'error')),
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('receiving', 'pending', 'completed', 'error')),
     duplicate boolean NOT NULL DEFAULT false,
     error text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX upload_items_upload ON upload_items(upload_id);
-CREATE TABLE jobs (
-    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    upload_item_id bigint NOT NULL UNIQUE REFERENCES upload_items(id),
-    attempts integer NOT NULL DEFAULT 0,
-    available_at timestamptz NOT NULL DEFAULT now(),
-    lease_until timestamptz,
-    lease_token text,
-    last_error text,
-    completed_at timestamptz,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX jobs_available ON jobs(available_at) WHERE completed_at IS NULL;
 CREATE TABLE web_sessions (
     token_hash text PRIMARY KEY,
     csrf_token text NOT NULL,

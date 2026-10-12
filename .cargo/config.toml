@@ -1,0 +1,4 @@
+[env]
+# apalis-postgres ships its own query metadata. Compile against that metadata,
+# even when DATABASE_URL points to a fresh test database without its tables yet.
+SQLX_OFFLINE = "true"

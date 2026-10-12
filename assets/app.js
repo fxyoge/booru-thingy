@@ -66,20 +66,58 @@ $('tags').addEventListener('input', async () => {
 });
 $('tags').addEventListener('keydown', (event) => { if (event.key === 'Escape') { $('suggestions').hidden = true; $('tags').setAttribute('aria-expanded', 'false'); } if (event.key === 'ArrowDown') { $('suggestions').querySelector('button')?.focus(); event.preventDefault(); } });
 document.addEventListener('click', (event) => { if (!event.target.closest('.tags-label')) { $('suggestions').hidden = true; $('tags').setAttribute('aria-expanded', 'false'); } });
+let transferBatch = null;
+function sendFile(ticket, file, progress) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    Object.entries(ticket.fields).forEach(([key, value]) => form.append(key, value));
+    form.append('file', file); // S3 requires the file part last.
+    const xhr = new XMLHttpRequest(); xhr.open('POST', ticket.url); xhr.timeout = 900000;
+    xhr.upload.onprogress = (event) => { if (event.lengthComputable) progress(Math.min(file.size, event.loaded / event.total * file.size)); };
+    xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Storage upload failed (${xhr.status}). Check storage CORS and upload policy.`));
+    xhr.onerror = () => reject(new Error('Storage connection interrupted. Check storage CORS and connectivity.'));
+    xhr.ontimeout = () => reject(new Error('Storage transfer timed out.'));
+    // Storage receives only its signed fields, never API credentials or cookies.
+    xhr.send(form);
+  });
+}
+async function transferFiles(metadata) {
+  const fingerprint = JSON.stringify([metadata, selected.map((item) => item.url)]);
+  if (!transferBatch || transferBatch.fingerprint !== fingerprint) {
+    const upload = await api('/uploads/direct', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...metadata, files: selected.map(({ file }) => ({ filename: file.name, size: file.size })) }) });
+    transferBatch = { fingerprint, id: upload.id, items: upload.upload_media_assets.map((item, index) => ({ id: item.id, file: selected[index].file, loaded: 0, transferred: false, completed: false })) };
+  }
+  const batch = transferBatch, errors = [], total = batch.items.reduce((sum, item) => sum + item.file.size, 0);
+  let cursor = 0;
+  const update = () => { const percent = Math.round(batch.items.reduce((sum, item) => sum + item.loaded, 0) / total * 100); $('progress').value = percent; $('transfer-label').textContent = `Transferring ${percent}% · ${batch.items.filter((item) => item.completed).length}/${batch.items.length} accepted`; };
+  const run = async () => {
+    while (cursor < batch.items.length) {
+      const item = batch.items[cursor++]; if (item.completed) continue;
+      const path = `/uploads/${batch.id}/items/${item.id}`;
+      try {
+        if (!item.transferred) {
+          item.loaded = 0;
+          const ticket = await api(`${path}/ticket`, { method: 'POST' });
+          await sendFile(ticket, item.file, (loaded) => { item.loaded = loaded; update(); });
+          item.loaded = item.file.size; item.transferred = true;
+        }
+        await api(`${path}/complete`, { method: 'POST' }); item.completed = true; update(); refresh();
+      } catch (error) { errors.push(`${item.file.name}: ${error.message}`); }
+    }
+  };
+  await Promise.all([run(), run()]);
+  if (errors.length) throw new Error(`${errors.join(' ')} Click Upload & keep to retry unfinished files.`);
+  transferBatch = null;
+}
 $('upload-form').addEventListener('submit', async (event) => {
   event.preventDefault(); if (busy) return; $('upload-error').textContent = '';
   if (mode === 'files' && !selected.length) { $('upload-error').textContent = 'Choose at least one file first.'; return; }
   if (mode === 'url' && !$('source-url').value.trim()) { $('upload-error').textContent = 'Enter a direct media URL first.'; return; }
-  const form = new FormData(); form.append('upload[source]', mode === 'url' ? $('source-url').value : $('source').value); form.append('upload[tag_string]', $('tags').value); form.append('upload[rating]', document.querySelector('[name=rating]:checked').value);
-  if (mode === 'files') selected.forEach(({ file }) => form.append('upload[files][]', file));
+  const metadata = { source: mode === 'url' ? $('source-url').value : $('source').value, tags: $('tags').value, rating: document.querySelector('[name=rating]:checked').value };
   busy = true;[...$('upload-form').elements].forEach((el) => el.disabled = true); $('transfer').hidden = false; $('progress').value = 0; previews(); $('transfer-label').textContent = 'Uploading…';
   try {
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest(); xhr.open('POST', '/uploads.json'); xhr.setRequestHeader('X-CSRF-Token', csrf); xhr.timeout = 600000;
-      xhr.upload.onprogress = (event) => { if (event.lengthComputable) { $('progress').value = event.loaded / event.total * 100; $('transfer-label').textContent = event.loaded === event.total ? 'Saving your upload…' : `Uploading ${Math.round($('progress').value)}%`; } };
-      xhr.onload = () => { let data; try { data = JSON.parse(xhr.responseText); } catch (_) { reject(new Error('Unexpected server response')); return; } if (xhr.status >= 200 && xhr.status < 300) resolve(data); else { if (xhr.status === 401) signedOut(); reject(new Error(data.reason || 'Upload failed')); } };
-      xhr.onerror = () => reject(new Error('Connection interrupted. Check recent uploads before trying again.')); xhr.ontimeout = () => reject(new Error('Upload timed out. Check recent uploads before trying again.')); xhr.send(form);
-    });
+    if (mode === 'files') await transferFiles(metadata);
+    else await api('/uploads.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upload: { source: metadata.source, tag_string: metadata.tags, rating: metadata.rating } }) });
     selected.forEach((item) => URL.revokeObjectURL(item.url)); selected = []; $('source-url').value = ''; $('source').value = ''; $('tags').value = ''; $('transfer-label').textContent = 'Received. Processing continues in the background.'; refresh();
   } catch (error) { $('upload-error').textContent = error.message; } finally { busy = false;[...$('upload-form').elements].forEach((el) => el.disabled = false); previews(); }
 });

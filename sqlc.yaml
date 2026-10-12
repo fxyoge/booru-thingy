@@ -1,0 +1,22 @@
+version: "2"
+plugins:
+  - name: sqlx
+    wasm:
+      url: https://github.com/mathematic-inc/sqlc-gen-sqlx/releases/download/v0.2.7/sqlc-gen-sqlx.wasm
+      sha256: a5c36d732cf5323201d086f6d6ba66cfb5409d227f1f968188b434e7d85ab57b
+sql:
+  - engine: postgresql
+    schema:
+      - vendor/apalis-postgres/schema.sql
+      - migrations
+    queries: queries
+    codegen:
+      - plugin: sqlx
+        out: src/db
+        options:
+          output: generated.rs
+          overrides:
+            - db_type: text
+              borrowed_rs_type: "&str"
+            - db_type: timestamptz
+              rs_type: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>

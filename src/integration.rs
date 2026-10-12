@@ -1,11 +1,10 @@
-use crate::{App, config::Config, router, storage::Storage, worker};
+use crate::{App, config::Config, db::generated as queries, router, storage::Storage, worker};
 use axum::{
     Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use clap::Parser;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{path::Path, time::Duration};
@@ -78,27 +77,67 @@ async fn generate(path: &Path, extension: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-fn multipart(files: &[(String, Vec<u8>)], tags: &str) -> Vec<u8> {
-    let mut bytes = format!("--test-boundary\r\nContent-Disposition: form-data; name=\"upload[tag_string]\"\r\n\r\n{tags}\r\n").into_bytes();
-    for (name, data) in files {
-        bytes.extend_from_slice(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"upload[files][]\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
-        bytes.extend_from_slice(data);
-        bytes.extend_from_slice(b"\r\n");
-    }
-    bytes.extend_from_slice(b"--test-boundary--\r\n");
-    bytes
-}
 async fn upload(router: &Router, auth: &str, files: &[(String, Vec<u8>)], tags: &str) -> Value {
     let (status, _, body) = request(
         router,
         "POST",
-        "/uploads.json",
-        multipart(files, tags),
-        "multipart/form-data; boundary=test-boundary",
+        "/uploads/direct",
+        serde_json::to_vec(&json!({"tags": tags, "files": files.iter().map(|(name, bytes)| json!({"filename":name,"size":bytes.len()})).collect::<Vec<_>>()})).unwrap(),
+        "application/json",
         &[("authorization", auth)],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    for (item, (name, data)) in body["upload_media_assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(files)
+    {
+        let path = format!("/uploads/{}/items/{}", body["id"], item["id"]);
+        let (status, _, ticket) = request(
+            router,
+            "POST",
+            &format!("{path}/ticket"),
+            vec![],
+            "",
+            &[("authorization", auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ticket}");
+        let mut multipart = Vec::new();
+        for (key, value) in ticket["fields"].as_object().unwrap() {
+            multipart.extend_from_slice(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{}\r\n",value.as_str().unwrap()).as_bytes());
+        }
+        multipart.extend_from_slice(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+        multipart.extend_from_slice(data);
+        multipart.extend_from_slice(b"\r\n--test-boundary--\r\n");
+        let response = reqwest::Client::new()
+            .post(ticket["url"].as_str().unwrap())
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=test-boundary",
+            )
+            .body(multipart)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        let (status, _, result) = request(
+            router,
+            "POST",
+            &format!("{path}/complete"),
+            vec![],
+            "",
+            &[("authorization", auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+    }
     body
 }
 async fn await_upload(router: &Router, auth: &str, id: i64) -> Value {
@@ -115,32 +154,299 @@ async fn await_upload(router: &Router, auth: &str, id: i64) -> Value {
     .expect("upload did not finish")
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "requires PostgreSQL"]
+async fn url_upload_creation_is_atomic(pool: PgPool) {
+    let config = std::sync::Arc::new(Config {
+        owner_api_key: "test-key".into(),
+        s3_endpoint: "http://127.0.0.1:9000".into(),
+        s3_bucket: "test".into(),
+        aws_access_key_id: "test-access".into(),
+        aws_secret_access_key: "test-secret".into(),
+        ..Config::default()
+    });
+    let routes = router(App {
+        storage: Storage::new(&config).unwrap(),
+        config,
+        db: pool.clone(),
+    });
+    let auth = format!("Basic {}", STANDARD.encode("owner:test-key"));
+    for fields in [
+        json!({"source":""}),
+        json!({"source":"file:///etc/passwd"}),
+        json!({"source":"https://user:password@example.com/image.png"}),
+        json!({"source":"https://example.com/image.png","rating":"invalid"}),
+        json!({"source":"https://example.com/image.png","tag_string":"invalid:tag"}),
+    ] {
+        let (status, _, body) = request(
+            &routes,
+            "POST",
+            "/uploads.json",
+            json!({"upload":fields}).to_string().into_bytes(),
+            "application/json",
+            &[("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let (status, _, _) = request(
+        &routes,
+        "POST",
+        "/uploads.json",
+        vec![],
+        "multipart/form-data; boundary=test",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for (content_type, body, tags, rating, referer) in [
+        (
+            "application/json",
+            json!({"upload":{"source":"https://example.com/image.png"}})
+                .to_string(),
+            "tagme",
+            "g",
+            "",
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            "upload[source]=https%3A%2F%2Fexample.com%2Fimage.png&upload[tag_string]=DOG+cat+dog&upload[rating]=q&upload[referer_url]=https%3A%2F%2Fexample.com".into(),
+            "cat dog",
+            "q",
+            "https://example.com",
+        ),
+    ] {
+        let (status, _, upload) = request(
+            &routes,
+            "POST",
+            "/uploads.json",
+            body.into_bytes(),
+            content_type,
+            &[("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{upload}");
+        assert_eq!(upload["source"], "https://example.com/image.png");
+        assert_eq!(upload["tag_string"], tags);
+        assert_eq!(upload["rating"], rating);
+        assert_eq!(upload["referer_url"], referer);
+        let items = upload["upload_media_assets"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["filename"], "image.png");
+        assert_eq!(items[0]["status"], "pending");
+    }
+
+    // Fail at the final insertion, after creating the upload and its source item.
+    sqlx::query("ALTER TABLE apalis.jobs ADD CONSTRAINT reject_enqueue CHECK (false) NOT VALID")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, _) = request(
+        &routes,
+        "POST",
+        "/uploads.json",
+        json!({"upload":{"source":"https://example.com/rollback.png"}})
+            .to_string()
+            .into_bytes(),
+        "application/json",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM uploads), (SELECT count(*) FROM upload_items), (SELECT count(*) FROM apalis.jobs)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (2, 2, 2));
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "requires PostgreSQL"]
+async fn upload_lists_batch_reads_and_preserve_response_semantics(pool: PgPool) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    sqlx::raw_sql(
+        "INSERT INTO uploads(id,source) OVERRIDING SYSTEM VALUE SELECT id,'https://example.com/' || id FROM generate_series(1,5) id;
+        INSERT INTO media_assets(id,sha256,md5,file_ext,content_type,file_size,image_width,image_height,original_key,status)
+        VALUES(1,'one','one','png','image/png',100,64,48,'media/one/original.png','active'),
+              (2,'two','two','jpg','image/jpeg',200,80,60,'media/two/original.jpg','active');
+        INSERT INTO media_variants(media_asset_id,kind,object_key,file_ext,content_type,width,height,file_size)
+        VALUES(1,'original','media/one/original.png','png','image/png',64,48,100),
+              (1,'180x180','media/one/preview.jpg','jpg','image/jpeg',64,48,50),
+              (2,'original','media/two/original.jpg','jpg','image/jpeg',80,60,200);
+        INSERT INTO posts(id,media_asset_id) VALUES(1,1),(2,2);
+        INSERT INTO favorites(post_id) VALUES(1);
+        INSERT INTO upload_items(id,upload_id,filename,status,media_asset_id,post_id,duplicate,error)
+        OVERRIDING SYSTEM VALUE
+        VALUES(11,1,'first.png','completed',1,1,false,NULL),
+              (12,1,'duplicate.png','completed',1,1,true,NULL),
+              (21,2,'second.jpg','completed',2,2,false,NULL),
+              (22,2,'broken.png','error',NULL,NULL,false,'invalid media'),
+              (31,3,'receiving.png','receiving',NULL,NULL,false,NULL),
+              (32,3,'pending.png','pending',1,NULL,false,'retrying'),
+              (41,4,'failed.png','error',NULL,NULL,false,'download failed');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    // Every standalone pool query acquires a connection. Only API reads use this pool.
+    let app_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .before_acquire({
+            let reads = reads.clone();
+            move |_, _| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(true) })
+            }
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let config = Arc::new(Config {
+        owner_api_key: "test-key".into(),
+        s3_endpoint: "http://127.0.0.1:9000".into(),
+        s3_bucket: "test".into(),
+        aws_access_key_id: "test-access".into(),
+        aws_secret_access_key: "test-secret".into(),
+        ..Config::default()
+    });
+    let routes = router(App {
+        storage: Storage::new(&config).unwrap(),
+        config,
+        db: app_pool.clone(),
+    });
+    let auth = format!("Basic {}", STANDARD.encode("owner:test-key"));
+    for (path, ids, expected_reads) in [
+        ("/uploads.json", vec![5, 4, 3, 2, 1], 4),
+        ("/users/1/uploads.json", vec![5, 4, 3, 2, 1], 4),
+        (
+            "/uploads.json?search[order]=id_asc&limit=2&page=2",
+            vec![3, 4],
+            4,
+        ),
+        ("/uploads.json?search[status]=completed", vec![1], 4),
+        ("/uploads.json?search[status]=error", vec![5, 4, 2], 4),
+        ("/uploads.json?search[status]=processing", vec![3], 4),
+        ("/uploads.json?search[is_posted]=true", vec![2, 1], 4),
+        ("/uploads.json?search[is_posted]=false", vec![5, 4, 3], 4),
+        ("/uploads.json?search[ai_tags_match]=unsupported", vec![], 0),
+        ("/uploads.json?page=100", vec![], 1),
+    ] {
+        reads.store(0, Ordering::SeqCst);
+        let uploads = get(&routes, path, &auth).await;
+        assert_eq!(reads.load(Ordering::SeqCst), expected_reads, "{path}");
+        let actual: Vec<_> = uploads
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(actual, ids, "{path}");
+    }
+    let uploads = get(&routes, "/uploads.json", &auth).await;
+    assert_eq!(uploads[0]["status"], "error"); // Empty upload.
+    assert!(uploads[0]["error"].is_null());
+    assert_eq!(uploads[1]["error"], "download failed");
+    assert_eq!(uploads[2]["status"], "processing");
+    assert_eq!(uploads[2]["error"], "retrying");
+    assert_eq!(uploads[3]["status"], "error"); // Mixed success/failure.
+    assert_eq!(uploads[3]["media_asset_count"], 1);
+    let completed = &uploads[4];
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["media_asset_count"], 2); // Preserve per-item duplicates.
+    assert_eq!(completed["posts"], json!([{"id":1},{"id":1}]));
+    assert_eq!(completed["upload_media_assets"][1]["duplicate"], true);
+    assert_eq!(
+        completed["upload_media_assets"][0]["page_url"],
+        "https://example.com/1"
+    );
+    let shared = &completed["media_assets"][0];
+    assert_eq!(shared["post"], json!({"id":1}));
+    assert_eq!(shared["variants"].as_array().unwrap().len(), 2);
+    assert!(shared.get("original_key").is_none());
+    assert!(shared.get("sha256").is_none());
+    for variant in shared["variants"].as_array().unwrap() {
+        assert!(variant.get("object_key").is_none());
+        let url = url::Url::parse(variant["url"].as_str().unwrap()).unwrap();
+        assert!(url.query_pairs().any(|(key, _)| key == "X-Amz-Signature"));
+    }
+    // Attaching a post to one item must not mutate a shared asset in another upload.
+    assert!(uploads[2]["media_assets"][0].get("post").is_none());
+    for upload in uploads.as_array().unwrap() {
+        assert_eq!(upload["uploader"]["post_upload_count"], 2);
+        assert_eq!(upload["uploader"]["favorite_count"], 1);
+    }
+    for (path, ids, expected_reads) in [
+        (
+            "/upload_media_assets.json",
+            vec![41, 31, 32, 21, 22, 11, 12],
+            4,
+        ),
+        (
+            "/upload_media_assets.json?search[upload_id]=1",
+            vec![11, 12],
+            4,
+        ),
+        ("/upload_media_assets.json?search[upload_id]=5", vec![], 3),
+    ] {
+        reads.store(0, Ordering::SeqCst);
+        let items = get(&routes, path, &auth).await;
+        assert_eq!(reads.load(Ordering::SeqCst), expected_reads, "{path}");
+        let actual: Vec<_> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(actual, ids, "{path}");
+    }
+    reads.store(0, Ordering::SeqCst);
+    let upload = get(&routes, "/uploads/1.json", &auth).await;
+    assert_eq!(reads.load(Ordering::SeqCst), 4);
+    assert_eq!(upload["media_asset_count"], 2);
+    for path in [
+        "/uploads/999.json",
+        "/upload_media_assets.json?search[upload_id]=999",
+    ] {
+        let (status, _, _) = request(
+            &routes,
+            "GET",
+            path,
+            vec![],
+            "",
+            &[("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    app_pool.close().await;
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
 #[ignore = "requires PostgreSQL, an S3 test endpoint, ffmpeg, and libvips"]
 async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
     let bucket = format!("test-{}", uuid::Uuid::new_v4());
-    let config = Config::parse_from([
-        "test",
-        "--database-url",
-        "unused",
-        "--owner-login",
-        "owner",
-        "--owner-api-key",
-        "test-key",
-        "--s3-endpoint",
-        &std::env::var("TEST_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
-        "--s3-bucket",
-        &bucket,
-        "--s3-access-key",
-        &std::env::var("TEST_S3_ACCESS_KEY").unwrap_or_else(|_| "local-access-key".into()),
-        "--s3-secret-key",
-        &std::env::var("TEST_S3_SECRET_KEY").unwrap_or_else(|_| "local-secret-key".into()),
-        "--worker-concurrency",
-        "2",
-        "--allow-private-source-urls",
-        "true",
-    ])
-    .validate()
+    let config = Config {
+        database_url: "postgres://localhost/test".into(),
+        owner_api_key: "test-key".into(),
+        s3_endpoint: std::env::var("TEST_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
+        s3_bucket: bucket,
+        aws_access_key_id: std::env::var("TEST_S3_ACCESS_KEY")
+            .unwrap_or_else(|_| "local-access-key".into()),
+        aws_secret_access_key: std::env::var("TEST_S3_SECRET_KEY")
+            .unwrap_or_else(|_| "local-secret-key".into()),
+        allow_private_source_urls: true,
+        ..Config::default()
+    }
+    .validate(None)
     .unwrap();
     let storage = Storage::new(&config).unwrap();
     storage.create_test_bucket().await.unwrap();
@@ -236,14 +542,15 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
     assert_eq!(accepted["status"], "processing");
     let upload_id = accepted["id"].as_i64().unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apalis.jobs")
             .fetch_one(&pool)
             .await
             .unwrap(),
         8
     );
     // Simulate a process disappearing after claiming a durable input.
-    sqlx::query("UPDATE jobs SET lease_token='dead-worker',lease_until=now()-interval '1 second',attempts=1 WHERE id=(SELECT min(id) FROM jobs)").execute(&pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO apalis.workers(id,worker_type,storage_name,last_seen) VALUES('dead-worker','uploads-v1','PgStorage',now()-interval '1 hour');
+        UPDATE apalis.jobs SET status='Running',lock_by='dead-worker',attempts=1 WHERE id=(SELECT min(id) FROM apalis.jobs)").execute(&pool).await.unwrap();
     let stop = CancellationToken::new();
     let workers = tokio::spawn(worker::run(app.clone(), stop.clone()));
     let completed = await_upload(&routes, &auth, upload_id).await;
@@ -290,6 +597,132 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
         variants
             .iter()
             .all(|v| v["width"].as_i64().unwrap() > 0 && v["height"].as_i64().unwrap() > 0)
+    );
+    // Simulate a crash after object-copy, before the DB completion commit. The
+    // orphaned copy is tracked; retrying uses a different immutable destination.
+    let (status, _, recovery) = request(
+        &routes,
+        "POST",
+        "/uploads/direct",
+        serde_json::to_vec(&json!({"files":[{"filename":"recovery.png","size":files[1].1.len()}]}))
+            .unwrap(),
+        "application/json",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let recovery_id = recovery["id"].as_i64().unwrap();
+    let recovery_item = recovery["upload_media_assets"][0]["id"].as_i64().unwrap();
+    let (status, _, recovery_ticket) = request(
+        &routes,
+        "POST",
+        &format!("/uploads/{recovery_id}/items/{recovery_item}/ticket"),
+        vec![],
+        "",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let incoming = recovery_ticket["fields"]["key"].as_str().unwrap();
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    tokio::fs::write(temp.path(), &files[1].1).await.unwrap();
+    app.storage
+        .put(incoming, temp.path(), "application/octet-stream")
+        .await
+        .unwrap();
+    let staging = format!("staging/{}", uuid::Uuid::new_v4());
+    queries::create_upload_snapshot(
+        &pool,
+        queries::CreateUploadSnapshotParams {
+            upload_item_id: recovery_item,
+            object_key: &staging,
+        },
+    )
+    .await
+    .unwrap();
+    app.storage
+        .snapshot(incoming, &staging, files[1].1.len() as i64)
+        .await
+        .unwrap();
+    let (status, _, _) = request(
+        &routes,
+        "POST",
+        &format!("/uploads/{recovery_id}/items/{recovery_item}/complete"),
+        vec![],
+        "",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let accepted: String = sqlx::query_scalar("SELECT staging_key FROM upload_items WHERE id=$1")
+        .bind(recovery_item)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(accepted, staging);
+    // Model the timed-out first copy completing late with different bytes.
+    tokio::fs::write(temp.path(), vec![b'x'; files[1].1.len()])
+        .await
+        .unwrap();
+    app.storage
+        .put(&staging, temp.path(), "application/octet-stream")
+        .await
+        .unwrap();
+    app.storage
+        .download(&accepted, temp.path(), 2097152)
+        .await
+        .unwrap();
+    assert_eq!(tokio::fs::read(temp.path()).await.unwrap(), files[1].1);
+    assert_eq!(
+        await_upload(&routes, &auth, recovery_id).await["status"],
+        "completed"
+    );
+    // Unexpired capabilities stay tracked even after publication and cleanup.
+    worker::cleanup(&app).await.unwrap();
+    let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_grants WHERE object_key=$1")
+        .bind(incoming)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(grants, 1);
+    sqlx::query(
+        "UPDATE upload_snapshots SET created_at=now()-interval '3 hours' WHERE object_key=$1",
+    )
+    .bind(&staging)
+    .execute(&pool)
+    .await
+    .unwrap();
+    worker::cleanup(&app).await.unwrap();
+    assert!(
+        app.storage
+            .download(&staging, temp.path(), 2097152)
+            .await
+            .is_err()
+    );
+    let snapshots: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_snapshots WHERE object_key=$1")
+            .bind(&staging)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(snapshots, 0);
+    sqlx::query("UPDATE upload_grants SET expires_at=now()-interval '2 hours' WHERE object_key=$1")
+        .bind(incoming)
+        .execute(&pool)
+        .await
+        .unwrap();
+    worker::cleanup(&app).await.unwrap();
+    let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_grants WHERE object_key=$1")
+        .bind(incoming)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(grants, 0);
+    assert!(
+        app.storage
+            .download(incoming, temp.path(), 2097152)
+            .await
+            .is_err()
     );
     let query = format!(
         "/posts/{post_id}.json?post%5Btag_string%5D=-green%20bird%20rating%3Aq&post%5Bold_tag_string%5D="
@@ -373,7 +806,6 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
         "tagme",
     )
     .await;
-    sqlx::query("UPDATE jobs SET attempts=2 WHERE upload_item_id IN (SELECT id FROM upload_items WHERE upload_id=$1)").bind(invalid["id"].as_i64().unwrap()).execute(&pool).await.unwrap();
     let failed = await_upload(&routes, &auth, invalid["id"].as_i64().unwrap()).await;
     assert_eq!(failed["status"], "error");
     assert!(failed["error"].as_str().unwrap().contains("unsupported"));
@@ -396,7 +828,7 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
         .as_array()
         .unwrap()
         .len(),
-        2
+        3
     );
     let (status, _, _) = request(
         &routes,
@@ -504,19 +936,18 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
     tokio::time::timeout(Duration::from_secs(5), started.notified())
         .await
         .unwrap();
-    stop.cancel();
-    tokio::time::timeout(Duration::from_secs(2), workers)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // Drop the whole runtime without graceful shutdown, as with process death.
+    workers.abort();
+    assert!(workers.await.unwrap_err().is_cancelled());
     let interrupted_id = interrupted["id"].as_i64().unwrap();
     assert_eq!(
         get(&routes, &format!("/uploads/{interrupted_id}.json"), &auth).await["status"],
         "processing"
     );
     slow.store(false, std::sync::atomic::Ordering::SeqCst);
-    sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE upload_item_id IN (SELECT id FROM upload_items WHERE upload_id=$1)").bind(interrupted_id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE apalis.workers SET last_seen=now()-interval '1 hour' WHERE id IN
+        (SELECT j.lock_by FROM apalis.jobs j JOIN upload_items i ON upload_task_run(j.job)=i.run_id WHERE i.upload_id=$1)")
+        .bind(interrupted_id).execute(&pool).await.unwrap();
     let stop = CancellationToken::new();
     let resumed = tokio::spawn(worker::run(app.clone(), stop.clone()));
     assert_eq!(

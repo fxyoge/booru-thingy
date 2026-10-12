@@ -1,131 +1,43 @@
 use crate::{
     App,
     api::{self, Params},
+    db::{generated as queries, optional},
     error::{Error, Result},
 };
 use axum::{
     Json, Router,
-    extract::{FromRequest, Multipart, Path, Query, Request, State},
+    extract::{Path, Query, Request, State},
     routing::{get, post},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{Postgres, QueryBuilder, Row};
-use tokio::io::AsyncWriteExt;
+use std::collections::{BTreeSet, HashMap};
 
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/uploads.json", post(create).get(index))
+        .route("/uploads/direct", post(reserve))
+        .route("/uploads/{id}/items/{item_id}/ticket", post(ticket))
+        .route("/uploads/{id}/items/{item_id}/complete", post(complete))
         .route("/uploads/{id}", get(show))
         .route("/uploads/{id}/retry", post(retry))
         .route("/users/{id}/uploads.json", get(user_index))
         .route("/upload_media_assets.json", get(items))
 }
 async fn create(State(app): State<App>, request: Request) -> Result<Json<Value>> {
-    let upload_id: i64 = sqlx::query_scalar("INSERT INTO uploads DEFAULT VALUES RETURNING id")
-        .fetch_one(&app.db)
-        .await?;
     let multipart = request
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("multipart/form-data"));
-    let result = if multipart {
-        match Multipart::from_request(request, &app).await {
-            Ok(mut multipart) => receive(&app, upload_id, &mut multipart).await,
-            Err(_) => Err(Error::bad("invalid multipart upload")),
-        }
-    } else {
-        let (parts, body) = request.into_parts();
-        match axum::body::to_bytes(body, 16384).await {
-            Ok(bytes) => match api::input(&parts.headers, &bytes) {
-                Ok(fields) => finalize(&app, upload_id, &fields, 0).await,
-                Err(error) => Err(error),
-            },
-            Err(_) => Err(Error::bad("upload form too large")),
-        }
-    };
-    if let Err(error) = result {
-        sqlx::query("UPDATE upload_items SET status='error',error='Upload interrupted or rejected',updated_at=now() WHERE upload_id=$1 AND status='receiving'").bind(upload_id).execute(&app.db).await?;
-        return Err(error);
+    if multipart {
+        return Err(Error::bad("use direct signed uploads for files"));
     }
-    Ok(Json(upload_object(&app, upload_id).await?))
-}
-async fn receive(app: &App, upload_id: i64, multipart: &mut Multipart) -> Result<()> {
-    let mut fields = Params::new();
-    let mut count = 0;
-    let mut total = 0_u64;
-    while let Some(mut field) = multipart
-        .next_field()
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 16384)
         .await
-        .map_err(|_| Error::bad("invalid multipart upload"))?
-    {
-        let name = field.name().unwrap_or("").to_owned();
-        if let Some(filename) = field.file_name().map(str::to_owned) {
-            if !matches!(
-                name.as_str(),
-                "upload[files]" | "upload[files][]" | "upload[file]"
-            ) {
-                return Err(Error::bad("unexpected file field"));
-            }
-            count += 1;
-            if count > 32 {
-                return Err(Error::bad("maximum 32 files per upload"));
-            }
-            let key = format!("staging/{}", uuid::Uuid::new_v4());
-            let item_id: i64 = sqlx::query_scalar("INSERT INTO upload_items(upload_id,filename,staging_key,status) VALUES ($1,$2,$3,'receiving') RETURNING id").bind(upload_id).bind(filename.chars().take(255).collect::<String>()).bind(&key).fetch_one(&app.db).await?;
-            let temp = tempfile::NamedTempFile::new().map_err(anyhow::Error::from)?;
-            let mut file = tokio::fs::File::create(temp.path())
-                .await
-                .map_err(anyhow::Error::from)?;
-            let mut size = 0;
-            while let Some(chunk) = field
-                .chunk()
-                .await
-                .map_err(|_| Error::bad("upload stream interrupted"))?
-            {
-                size += chunk.len() as u64;
-                total += chunk.len() as u64;
-                if total > app.config.max_upload_bytes {
-                    return Err(Error(
-                        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                        "upload exceeds configured size limit".into(),
-                    ));
-                }
-                file.write_all(&chunk).await.map_err(anyhow::Error::from)?;
-            }
-            if size == 0 {
-                return Err(Error::bad("empty files are not supported"));
-            }
-            file.flush().await.map_err(anyhow::Error::from)?;
-            app.storage
-                .put(&key, temp.path(), "application/octet-stream")
-                .await?;
-            // Keep receiving until every input and its metadata has been accepted.
-            sqlx::query("UPDATE upload_items SET updated_at=now() WHERE id=$1")
-                .bind(item_id)
-                .execute(&app.db)
-                .await?;
-        } else {
-            let mut value = Vec::new();
-            while let Some(chunk) = field
-                .chunk()
-                .await
-                .map_err(|_| Error::bad("invalid form field"))?
-            {
-                if value.len() + chunk.len() > 16384 {
-                    return Err(Error::bad("form field too large"));
-                }
-                value.extend_from_slice(&chunk);
-            }
-            fields.insert(
-                name,
-                String::from_utf8(value).map_err(|_| Error::bad("form fields must be UTF-8"))?,
-            );
-        }
-    }
-    finalize(app, upload_id, &fields, count).await
-}
-async fn finalize(app: &App, upload_id: i64, fields: &Params, count: usize) -> Result<()> {
+        .map_err(|_| Error::bad("upload form too large"))?;
+    let fields = api::input(&parts.headers, &bytes)?;
     let source = fields
         .get("upload[source]")
         .map(String::as_str)
@@ -146,45 +58,317 @@ async fn finalize(app: &App, upload_id: i64, fields: &Params, count: usize) -> R
             .map(String::as_str)
             .unwrap_or("g"),
     )?;
+    let url = url::Url::parse(source)
+        .map_err(|_| Error::bad("choose files or enter a direct media URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(Error::bad(
+            "source must be an HTTP(S) URL without credentials",
+        ));
+    }
     let mut tx = app.db.begin().await?;
-    sqlx::query("UPDATE uploads SET source=$2,tag_string=$3,rating=$4,referer_url=$5,updated_at=now() WHERE id=$1")
-        .bind(upload_id).bind(source).bind(tags).bind(rating).bind(fields.get("upload[referer_url]").cloned().unwrap_or_default()).execute(&mut *tx).await?;
-    if count == 0 {
-        let url = url::Url::parse(source)
-            .map_err(|_| Error::bad("choose files or enter a direct media URL"))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(Error::bad(
-                "source must be an HTTP(S) URL without credentials",
+    let upload_id = queries::create_upload(&mut tx).await?.id;
+    queries::update_upload_metadata(
+        &mut tx,
+        queries::UpdateUploadMetadataParams {
+            id: upload_id,
+            source,
+            tag_string: &tags,
+            rating,
+            referer_url: fields
+                .get("upload[referer_url]")
+                .map(String::as_str)
+                .unwrap_or(""),
+        },
+    )
+    .await?;
+    let item = queries::create_source_item(
+        &mut tx,
+        queries::CreateSourceItemParams {
+            upload_id,
+            source_url: source,
+            filename: url
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .unwrap_or("import"),
+        },
+    )
+    .await?;
+    crate::worker::enqueue(&mut tx, item.id).await?;
+    tx.commit().await?;
+    Ok(Json(upload_object(&app, upload_id).await?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reservation {
+    files: Vec<ReservedFile>,
+    #[serde(default)]
+    tags: String,
+    #[serde(default = "general_rating")]
+    rating: String,
+    #[serde(default)]
+    source: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReservedFile {
+    filename: String,
+    size: u64,
+}
+fn general_rating() -> String {
+    "g".into()
+}
+
+async fn reserve(State(app): State<App>, Json(input): Json<Reservation>) -> Result<Json<Value>> {
+    if input.files.is_empty() || input.files.len() > 32 {
+        return Err(Error::bad("choose files (maximum 32 files per upload)"));
+    }
+    let mut total = 0_u64;
+    for file in &input.files {
+        if file.size == 0 {
+            return Err(Error::bad("empty files are not supported"));
+        }
+        total = total
+            .checked_add(file.size)
+            .ok_or_else(|| Error::bad("invalid file sizes"))?;
+        if total > app.config.max_upload_bytes {
+            return Err(Error(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "upload exceeds configured size limit".into(),
             ));
         }
-        sqlx::query("INSERT INTO upload_items(upload_id,source_url,filename) VALUES ($1,$2,$3)")
-            .bind(upload_id)
-            .bind(source)
-            .bind(
-                url.path_segments()
-                    .and_then(|mut s| s.next_back())
-                    .unwrap_or("import"),
-            )
-            .execute(&mut *tx)
-            .await?;
+        if file.filename.is_empty() || file.filename.chars().count() > 255 {
+            return Err(Error::bad("filename must contain 1..255 characters"));
+        }
     }
-    sqlx::query("UPDATE upload_items SET status='pending',updated_at=now() WHERE upload_id=$1 AND status='receiving'").bind(upload_id).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO jobs(upload_item_id) SELECT id FROM upload_items WHERE upload_id=$1")
-        .bind(upload_id)
-        .execute(&mut *tx)
+    let tags = api::normalize_tags(if input.tags.trim().is_empty() {
+        "tagme"
+    } else {
+        &input.tags
+    })?
+    .into_iter()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let rating = api::rating(&input.rating)?;
+    let mut tx = app.db.begin().await?;
+    let upload_id = queries::create_upload(&mut tx).await?.id;
+    queries::update_upload_metadata(
+        &mut tx,
+        queries::UpdateUploadMetadataParams {
+            id: upload_id,
+            source: &input.source,
+            tag_string: &tags,
+            rating,
+            referer_url: "",
+        },
+    )
+    .await?;
+    for file in &input.files {
+        queries::create_direct_item(
+            &mut tx,
+            queries::CreateDirectItemParams {
+                upload_id,
+                filename: &file.filename,
+                expected_size: Some(file.size as i64),
+            },
+        )
         .await?;
+    }
     tx.commit().await?;
-    Ok(())
+    Ok(Json(upload_object(&app, upload_id).await?))
 }
-pub async fn upload_object(app: &App, upload_id: i64) -> Result<Value> {
-    let mut upload: Value = sqlx::query_scalar("SELECT to_jsonb(u) FROM uploads u WHERE id=$1")
-        .bind(upload_id)
-        .fetch_one(&app.db)
+
+async fn ticket(
+    State(app): State<App>,
+    Path((upload, item)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let upload_id = api::id(&upload)?;
+    let item_id = api::id(&item)?;
+    let mut tx = app.db.begin().await?;
+    let row = queries::lock_direct_item(
+        &mut tx,
+        queries::LockDirectItemParams {
+            id: item_id,
+            upload_id,
+        },
+    )
+    .await?;
+    if row.status != "receiving" {
+        return Err(Error(
+            axum::http::StatusCode::CONFLICT,
+            "item no longer accepts transfers".into(),
+        ));
+    }
+    if queries::count_upload_grants(&mut tx, item_id).await?.count >= 8 {
+        return Err(Error::bad(
+            "too many transfer attempts; reserve a new upload",
+        ));
+    }
+    let key = format!("incoming/{}", uuid::Uuid::new_v4());
+    let expires =
+        chrono::Utc::now() + chrono::Duration::seconds(app.config.upload_ticket_ttl_seconds.into());
+    queries::create_upload_grant(
+        &mut tx,
+        queries::CreateUploadGrantParams {
+            upload_item_id: item_id,
+            object_key: &key,
+            expires_at: expires,
+        },
+    )
+    .await?;
+    queries::touch_upload_item(&mut tx, item_id).await?;
+    tx.commit().await?;
+    Ok(Json(app.storage.upload_ticket(
+        &key,
+        row.expected_size.unwrap(),
+        expires,
+    )))
+}
+
+async fn complete(
+    State(app): State<App>,
+    Path((upload, item)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let upload_id = api::id(&upload)?;
+    let item_id = api::id(&item)?;
+    let mut tx = app.db.begin().await?;
+    let row = queries::lock_direct_item(
+        &mut tx,
+        queries::LockDirectItemParams {
+            id: item_id,
+            upload_id,
+        },
+    )
+    .await?;
+    if row.status == "receiving" {
+        let grant = optional(queries::latest_upload_grant(&mut tx, item_id).await)?
+            .ok_or_else(|| Error::bad("request an upload ticket first"))?;
+        // Completion may follow a transfer that started before its ticket expired.
+        if grant.expires_at + chrono::Duration::hours(1) < chrono::Utc::now() {
+            return Err(Error::bad("upload ticket expired; retry the transfer"));
+        }
+        let staging = format!("staging/{}", uuid::Uuid::new_v4());
+        queries::create_upload_snapshot(
+            &mut tx,
+            queries::CreateUploadSnapshotParams {
+                upload_item_id: item_id,
+                object_key: &staging,
+            },
+        )
         .await?;
-    let records = sqlx::query("SELECT *,created_at::text AS created,updated_at::text AS updated FROM upload_items WHERE upload_id=$1 ORDER BY id").bind(upload_id).fetch_all(&app.db).await?;
+        queries::touch_upload_item(&mut tx, item_id).await?;
+        // Persist the unique destination before issuing the copy. A timeout or
+        // crash can leave an object, but can never overwrite another attempt.
+        tx.commit().await?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            app.storage
+                .snapshot(&grant.object_key, &staging, row.expected_size.unwrap()),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(Error(axum::http::StatusCode::CONFLICT, error.to_string()));
+            }
+            Err(_) => {
+                return Err(Error(
+                    axum::http::StatusCode::CONFLICT,
+                    "upload snapshot timed out; retry completion".into(),
+                ));
+            }
+        }
+        tx = app.db.begin().await?;
+        let current = queries::lock_direct_item(
+            &mut tx,
+            queries::LockDirectItemParams {
+                id: item_id,
+                upload_id,
+            },
+        )
+        .await?;
+        if current.status == "receiving" {
+            let latest = optional(queries::latest_upload_grant(&mut tx, item_id).await)?;
+            if latest.as_ref().map(|g| &g.object_key) != Some(&grant.object_key) {
+                return Err(Error(
+                    axum::http::StatusCode::CONFLICT,
+                    "transfer ticket changed; retry completion".into(),
+                ));
+            }
+            queries::accept_direct_item(
+                &mut tx,
+                queries::AcceptDirectItemParams {
+                    id: item_id,
+                    staging_key: Some(&staging),
+                },
+            )
+            .await?;
+            crate::worker::enqueue(&mut tx, item_id).await?;
+            queries::touch_upload(&mut tx, upload_id).await?;
+        } else if current.accepted_at.is_none() {
+            return Err(Error(
+                axum::http::StatusCode::CONFLICT,
+                "item expired during completion".into(),
+            ));
+        }
+    } else if row.status == "error" && row.accepted_at.is_none() {
+        return Err(Error(
+            axum::http::StatusCode::CONFLICT,
+            "item failed; retry transfer or processing".into(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(Json(upload_object(&app, upload_id).await?))
+}
+async fn upload_object(app: &App, upload_id: i64) -> Result<Value> {
+    let upload = queries::get_upload(&app.db, upload_id).await?.payload;
+    Ok(upload_objects(app, vec![upload]).await?.remove(0))
+}
+async fn upload_objects(app: &App, uploads: Vec<Value>) -> Result<Vec<Value>> {
+    if uploads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<_> = uploads.iter().map(|u| u["id"].as_i64().unwrap()).collect();
+    let records = queries::list_upload_items(&app.db, ids).await?;
+    let asset_ids: Vec<_> = records
+        .iter()
+        .filter_map(|row| row.media_asset_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut assets = HashMap::new();
+    if !asset_ids.is_empty() {
+        for row in queries::get_media_assets(&app.db, asset_ids).await? {
+            assets.insert(row.id, api::serialize_asset(app, row.payload).await?);
+        }
+    }
+    let owner = api::owner(app).await?;
+    let mut items_by_upload: HashMap<_, Vec<_>> = HashMap::new();
+    for row in records {
+        items_by_upload.entry(row.upload_id).or_default().push(row);
+    }
+    uploads
+        .into_iter()
+        .map(|upload| {
+            let id = upload["id"].as_i64().unwrap();
+            serialize_upload(
+                upload,
+                items_by_upload.remove(&id).unwrap_or_default(),
+                &assets,
+                &owner,
+            )
+        })
+        .collect()
+}
+fn serialize_upload(
+    mut upload: Value,
+    records: Vec<queries::ListUploadItemsRow>,
+    media_assets: &HashMap<i64, Value>,
+    owner: &Value,
+) -> Result<Value> {
+    let upload_id = upload["id"].as_i64().unwrap();
     let mut items = Vec::new();
     let mut assets = Vec::new();
     let mut posts = Vec::new();
@@ -192,18 +376,21 @@ pub async fn upload_object(app: &App, upload_id: i64) -> Result<Value> {
     let mut failed = false;
     let mut errors = Vec::new();
     for row in records {
-        let status: String = row.get("status");
+        let status = row.status;
         pending |= !matches!(status.as_str(), "completed" | "error");
         failed |= status == "error";
-        let error: Option<String> = row.get("error");
+        let error = (!row.error.is_empty()).then_some(row.error);
         if let Some(error) = &error {
             errors.push(error.clone());
         }
-        let asset_id: Option<i64> = row.get("media_asset_id");
-        let post_id: Option<i64> = row.get("post_id");
-        let mut item = json!({"id":row.get::<i64,_>("id"),"upload_id":upload_id,"media_asset_id":asset_id,"status":status,"error":error,"source_url":row.get::<String,_>("source_url"),"page_url":upload["source"],"filename":row.get::<String,_>("filename"),"duplicate":row.get::<bool,_>("duplicate"),"post_id":post_id,"created_at":row.get::<String,_>("created"),"updated_at":row.get::<String,_>("updated")});
+        let asset_id = row.media_asset_id;
+        let post_id = row.post_id;
+        let mut item = json!({"id":row.id,"upload_id":upload_id,"media_asset_id":asset_id,"status":status,"error":error,"source_url":row.source_url,"page_url":upload["source"],"filename":row.filename,"duplicate":row.duplicate,"post_id":post_id,"created_at":row.created,"updated_at":row.updated});
         if let Some(asset_id) = asset_id {
-            let mut asset = api::asset_by_id(app, asset_id).await?;
+            let mut asset = media_assets
+                .get(&asset_id)
+                .ok_or_else(Error::missing)?
+                .clone();
             if let Some(post_id) = post_id {
                 asset["post"] = json!({"id":post_id});
                 posts.push(json!({"id":post_id}));
@@ -226,7 +413,7 @@ pub async fn upload_object(app: &App, upload_id: i64) -> Result<Value> {
         json!(errors.join("; "))
     };
     upload["uploader_id"] = json!(1);
-    upload["uploader"] = api::owner(app).await?;
+    upload["uploader"] = owner.clone();
     upload["media_asset_count"] = json!(assets.len());
     upload["upload_media_assets"] = json!(items);
     upload["media_assets"] = json!(assets);
@@ -251,69 +438,54 @@ async fn user_index(
 }
 async fn list(app: App, params: Params) -> Result<Json<Value>> {
     let limit = api::limit(&params, 20);
-    let mut query = QueryBuilder::<Postgres>::new("SELECT u.id FROM uploads u WHERE true");
-    if let Some(posted) = params.get("search[is_posted]") {
-        match posted.as_str() {
-            "true" | "1" => {
-                query.push(" AND EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.post_id IS NOT NULL)");
-            }
-            "false" | "0" => {
-                query.push(" AND NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.post_id IS NOT NULL)");
-            }
-            _ => return Err(Error::bad("invalid is_posted filter")),
-        }
-    }
-    if let Some(status) = params.get("search[status]") {
-        match status.as_str() {
-            "pending" | "processing" => {
-                query.push(" AND EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.status IN ('receiving','pending','processing'))");
-            }
-            "completed" => {
-                query.push(" AND EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id) AND NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.status<>'completed')");
-            }
-            "error" => {
-                query.push(" AND (NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id) OR EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.status='error')) AND NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.status IN ('receiving','pending','processing'))");
-            }
-            _ => return Err(Error::bad("invalid status filter")),
-        }
+    let is_posted = match params.get("search[is_posted]").map(String::as_str) {
+        Some("true" | "1") => Some(true),
+        Some("false" | "0") => Some(false),
+        Some(_) => return Err(Error::bad("invalid is_posted filter")),
+        None => None,
+    };
+    let status = params.get("search[status]").map(String::as_str);
+    if status.is_some_and(|s| !matches!(s, "pending" | "processing" | "completed" | "error")) {
+        return Err(Error::bad("invalid status filter"));
     }
     if params
         .get("search[ai_tags_match]")
         .is_some_and(|v| !v.is_empty())
     {
-        query.push(" AND false");
+        return Ok(Json(json!([])));
     }
-    query.push(
-        if params.get("search[order]").is_some_and(|v| v == "id_asc") {
-            " ORDER BY u.id ASC"
-        } else {
-            " ORDER BY u.id DESC"
+    let uploads = queries::list_uploads(
+        &app.db,
+        queries::ListUploadsParams {
+            is_posted,
+            status,
+            ascending: params.get("search[order]").is_some_and(|v| v == "id_asc"),
+            result_limit: limit,
+            result_offset: api::offset(&params, limit),
         },
-    );
-    query
-        .push(" LIMIT ")
-        .push_bind(limit)
-        .push(" OFFSET ")
-        .push_bind(api::offset(&params, limit));
-    let ids: Vec<i64> = query.build_query_scalar().fetch_all(&app.db).await?;
-    let mut output = Vec::new();
-    for id in ids {
-        output.push(upload_object(&app, id).await?);
-    }
-    Ok(Json(json!(output)))
+    )
+    .await?
+    .into_iter()
+    .map(|r| r.payload)
+    .collect();
+    Ok(Json(json!(upload_objects(&app, uploads).await?)))
 }
 async fn items(State(app): State<App>, Query(params): Query<Params>) -> Result<Json<Value>> {
-    let ids: Vec<i64> = if let Some(upload_id) = params.get("search[upload_id]") {
-        vec![api::id(upload_id)?]
+    let uploads = if let Some(upload_id) = params.get("search[upload_id]") {
+        vec![
+            queries::get_upload(&app.db, api::id(upload_id)?)
+                .await?
+                .payload,
+        ]
     } else {
-        sqlx::query_scalar("SELECT id FROM uploads ORDER BY id DESC LIMIT $1")
-            .bind(api::limit(&params, 20))
-            .fetch_all(&app.db)
+        queries::recent_uploads(&app.db, api::limit(&params, 20))
             .await?
+            .into_iter()
+            .map(|row| row.payload)
+            .collect()
     };
     let mut output = Vec::new();
-    for id in ids {
-        let upload = upload_object(&app, id).await?;
+    for upload in upload_objects(&app, uploads).await? {
         output.extend(
             upload["upload_media_assets"]
                 .as_array()
@@ -327,9 +499,15 @@ async fn items(State(app): State<App>, Query(params): Query<Params>) -> Result<J
 async fn retry(State(app): State<App>, Path(value): Path<String>) -> Result<Json<Value>> {
     let upload_id = api::id(&value)?;
     let mut tx = app.db.begin().await?;
-    let ids: Vec<i64> = sqlx::query_scalar("UPDATE upload_items SET status='pending',error=NULL,updated_at=now() WHERE upload_id=$1 AND status='error' AND (staging_key IS NOT NULL OR source_url <> '') RETURNING id").bind(upload_id).fetch_all(&mut *tx).await?;
-    for id in ids {
-        sqlx::query("INSERT INTO jobs(upload_item_id) VALUES ($1) ON CONFLICT(upload_item_id) DO UPDATE SET attempts=0,available_at=now(),lease_until=NULL,lease_token=NULL,completed_at=NULL,last_error=NULL").bind(id).execute(&mut *tx).await?;
+    let items = queries::lock_retry_upload_items(&mut tx, upload_id).await?;
+    for item in items {
+        if queries::get_upload_item_state(&mut tx, item.id)
+            .await?
+            .status
+            == "error"
+        {
+            crate::worker::enqueue(&mut tx, item.id).await?;
+        }
     }
     tx.commit().await?;
     Ok(Json(upload_object(&app, upload_id).await?))

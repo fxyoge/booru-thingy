@@ -2,6 +2,7 @@ FROM rust:1.99-trixie AS build
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
 COPY src ./src
 COPY migrations ./migrations
 COPY templates ./templates
@@ -20,3 +21,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=6s --start-period=15s \
     CMD curl --fail --silent http://127.0.0.1:8080/healthz || exit 1
 ENTRYPOINT ["booru-thingy"]
+CMD ["run"]

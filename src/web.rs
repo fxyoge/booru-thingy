@@ -1,4 +1,4 @@
-use crate::App;
+use crate::{App, db::generated as queries};
 use axum::{
     extract::{Request, State},
     http::{StatusCode, header},
@@ -28,8 +28,7 @@ pub async fn js() -> impl IntoResponse {
 }
 pub async fn ready(State(app): State<App>) -> impl IntoResponse {
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        sqlx::query("SELECT id FROM user_settings WHERE id=1")
-            .fetch_one(&app.db)
+        queries::check_database_ready(&app.db)
             .await
             .map_err(anyhow::Error::from)?;
         app.storage.ready().await
@@ -41,7 +40,7 @@ pub async fn ready(State(app): State<App>) -> impl IntoResponse {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")
     }
 }
-pub async fn headers(request: Request, next: Next) -> Response {
+pub async fn headers(State(app): State<App>, request: Request, next: Next) -> Response {
     let start = std::time::Instant::now();
     let method = request.method().clone();
     // Log the route path only, never query credentials, cookies, or media URLs.
@@ -50,7 +49,8 @@ pub async fn headers(request: Request, next: Next) -> Response {
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
-    headers.insert("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: https: http:; media-src blob: https: http:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'".parse().unwrap());
+    let storage_origin = app.storage.upload_origin();
+    headers.insert("content-security-policy",format!("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: https: http:; media-src blob: https: http:; connect-src 'self' {storage_origin}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'").parse().unwrap());
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     tracing::info!(%method,%path,status=response.status().as_u16(),elapsed_ms=start.elapsed().as_millis(),"request");
     response

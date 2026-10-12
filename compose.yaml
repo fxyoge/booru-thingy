@@ -1,21 +1,21 @@
 services:
   app:
     build: .
-    ports: ["8080:8080"]
+    ports: ["127.0.0.1:8080:8080"]
     environment:
-      DATABASE_URL: postgres://booru:booru@postgres:5432/booru
+      DATABASE_URL: postgres://booru:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/booru
       BASE_URL: ${BASE_URL:-http://localhost:8080}
-      OWNER_LOGIN: ${OWNER_LOGIN:-owner}
+      OWNER_LOGIN: ${OWNER_LOGIN:-admin}
       OWNER_API_KEY: ${OWNER_API_KEY:?Set OWNER_API_KEY in .env}
       S3_ENDPOINT: http://seaweedfs:9000
-      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
       S3_REGION: us-east-1
       S3_BUCKET: booru
-      AWS_ACCESS_KEY_ID: local-access-key
-      AWS_SECRET_ACCESS_KEY: local-secret-key
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
     depends_on:
       postgres: {condition: service_healthy}
-      seaweedfs: {condition: service_started}
+      bucket-init: {condition: service_completed_successfully}
     restart: unless-stopped
     read_only: true
     tmpfs: ["/tmp:size=2g,uid=10001,gid=10001,mode=1777"]
@@ -25,7 +25,7 @@ services:
     environment:
       POSTGRES_DB: booru
       POSTGRES_USER: booru
-      POSTGRES_PASSWORD: booru
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports: ["127.0.0.1:5432:5432"]
     volumes: ["postgres-data:/var/lib/postgresql/data"]
     healthcheck:
@@ -34,13 +34,38 @@ services:
       timeout: 3s
       retries: 20
 
+  bucket-init:
+    build: .
+    entrypoint: ["/bin/sh", "-ec"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
+      BASE_URL: ${BASE_URL:-http://localhost:8080}
+    command:
+      - |
+        s3() {
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 10 \
+            --aws-sigv4 aws:amz:us-east-1:s3 --user "$$AWS_ACCESS_KEY_ID:$$AWS_SECRET_ACCESS_KEY" "$$@"
+        }
+        for attempt in $$(seq 1 60); do
+          if s3 --head http://seaweedfs:9000/booru || s3 -X PUT http://seaweedfs:9000/booru; then break; fi
+          sleep 1
+        done
+        s3 -X PUT 'http://seaweedfs:9000/booru?cors' -H 'Content-Type: application/xml' \
+          --data "<CORSConfiguration><CORSRule><AllowedOrigin>$${BASE_URL%/}</AllowedOrigin><AllowedMethod>POST</AllowedMethod><AllowedHeader>*</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>300</MaxAgeSeconds></CORSRule></CORSConfiguration>"
+    depends_on:
+      seaweedfs: {condition: service_started}
+    read_only: true
+    healthcheck: {disable: true}
+
   seaweedfs:
     image: chrislusf/seaweedfs:4.48
-    command: mini -ip=seaweedfs -s3.port=9000 -s3.autoCreateBucket=false -admin.port=9001
+    # Bucket CORS alone does not constrain SeaweedFS's global preflight handler.
+    command: mini -ip=seaweedfs -s3.port=9000 -s3.autoCreateBucket=false -s3.allowedOrigins=${BASE_URL:-http://localhost:8080} -admin.port=9001
     environment:
-      AWS_ACCESS_KEY_ID: local-access-key
-      AWS_SECRET_ACCESS_KEY: local-secret-key
-    ports: ["9000:9000", "127.0.0.1:9001:9001"]
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     volumes: ["media-data:/data"]
 
 volumes:

@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod config;
+mod db;
 mod error;
 #[cfg(test)]
 mod integration;
@@ -18,7 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use config::{Command, Config};
+use config::{Cli, Command, Config};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -32,22 +33,27 @@ pub struct App {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let config = Config::load(&cli)?;
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "booru_thingy=info".into()),
+            tracing_subscriber::EnvFilter::try_new(&config.rust_log)
+                .map_err(|_| anyhow::anyhow!("invalid RUST_LOG / rust_log"))?,
         )
         .init();
-    let config = Config::parse().validate()?;
     let db = PgPoolOptions::new()
-        .max_connections((app_connection_limit(&config)) as u32)
+        .max_connections(if cli.command == Some(Command::Migrate) {
+            1
+        } else {
+            app_connection_limit(&config) as u32
+        })
         .connect(&config.database_url)
         .await?;
-    if config.command.is_none() || config.command == Some(Command::Migrate) {
-        sqlx::migrate!().run(&db).await?;
+    if matches!(cli.command, Some(Command::Run | Command::Migrate)) {
+        db::MIGRATOR.run(&db).await?;
     }
-    if config.command == Some(Command::Migrate) {
+    if cli.command == Some(Command::Migrate) {
         return Ok(());
     }
     let app = App {
@@ -63,31 +69,39 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
         shutdown.cancel();
     });
-    let worker = if app.config.command != Some(Command::Serve) {
-        Some(tokio::spawn(worker::run(app.clone(), stop.clone())))
-    } else {
-        None
+    let server = async {
+        if cli.command != Some(Command::Worker) {
+            let listener = tokio::net::TcpListener::bind(app.config.listen_addr).await?;
+            tracing::info!(address = %app.config.listen_addr, "server listening");
+            axum::serve(listener, router(app.clone()))
+                .with_graceful_shutdown(stop.clone().cancelled_owned())
+                .await?;
+            stop.cancel();
+        } else {
+            stop.cancelled().await;
+        }
+        Ok::<_, anyhow::Error>(())
     };
-    if app.config.command != Some(Command::Worker) {
-        let listener = tokio::net::TcpListener::bind(app.config.listen_addr).await?;
-        tracing::info!(address = %app.config.listen_addr, "server listening");
-        axum::serve(listener, router(app.clone()))
-            .with_graceful_shutdown(stop.clone().cancelled_owned())
-            .await?;
-        stop.cancel();
-    } else {
-        stop.cancelled().await;
-    }
-    if let Some(worker) = worker {
-        worker.await??;
-    }
+    let workers = async {
+        if cli.command != Some(Command::Serve) {
+            worker::run(app.clone(), stop.clone()).await?;
+        } else {
+            stop.cancelled().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    // A failed workflow runtime must fail the process, not leave an API accepting
+    // uploads with no functioning workers. Both futures are owned by this scope.
+    let outcome = tokio::try_join!(server, workers);
+    stop.cancel();
     app.db.close().await;
+    outcome?;
     Ok(())
 }
 
 fn app_connection_limit(config: &Config) -> usize {
-    // Processing holds a transaction; leave room for heartbeats and API traffic.
-    (config.worker_concurrency * 2 + 8).max(12)
+    // Media work is outside transactions; publication and API writes are short.
+    (config.worker_concurrency + 8).max(12)
 }
 
 pub fn router(app: App) -> Router {
@@ -107,9 +121,7 @@ pub fn router(app: App) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(web::ready))
         .merge(protected)
-        .layer(DefaultBodyLimit::max(
-            (app.config.max_upload_bytes as usize).saturating_add(1024 * 1024),
-        ))
-        .layer(middleware::from_fn(web::headers))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(middleware::from_fn_with_state(app.clone(), web::headers))
         .with_state(app)
 }
