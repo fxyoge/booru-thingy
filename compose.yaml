@@ -1,0 +1,48 @@
+services:
+  app:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      DATABASE_URL: postgres://booru:booru@postgres:5432/booru
+      BASE_URL: ${BASE_URL:-http://localhost:8080}
+      OWNER_LOGIN: ${OWNER_LOGIN:-owner}
+      OWNER_API_KEY: ${OWNER_API_KEY:?Set OWNER_API_KEY in .env}
+      S3_ENDPOINT: http://seaweedfs:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: booru
+      AWS_ACCESS_KEY_ID: local-access-key
+      AWS_SECRET_ACCESS_KEY: local-secret-key
+    depends_on:
+      postgres: {condition: service_healthy}
+      seaweedfs: {condition: service_started}
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp:size=2g,uid=10001,gid=10001,mode=1777"]
+
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: booru
+      POSTGRES_USER: booru
+      POSTGRES_PASSWORD: booru
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booru -d booru"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    command: mini -ip=seaweedfs -s3.port=9000 -s3.autoCreateBucket=false -admin.port=9001
+    environment:
+      AWS_ACCESS_KEY_ID: local-access-key
+      AWS_SECRET_ACCESS_KEY: local-secret-key
+    ports: ["9000:9000", "127.0.0.1:9001:9001"]
+    volumes: ["media-data:/data"]
+
+volumes:
+  postgres-data:
+  media-data:

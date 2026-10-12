@@ -1,0 +1,102 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U test -d test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      s3:
+        image: motoserver/moto:5.2.4
+        ports: ['5000:5000']
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/test
+      TEST_S3_ENDPOINT: http://localhost:5000
+      TEST_S3_ACCESS_KEY: local-access-key
+      TEST_S3_SECRET_KEY: local-secret-key
+      OWNER_LOGIN: owner
+      OWNER_API_KEY: ci-test-key
+      S3_ENDPOINT: http://localhost:5000
+      S3_BUCKET: browser-tests
+      AWS_ACCESS_KEY_ID: local-access-key
+      AWS_SECRET_ACCESS_KEY: local-secret-key
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libvips-tools
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked -- --ignored
+      - run: node --check assets/app.js
+      - run: pip install playwright==1.51.0 && playwright install chromium --with-deps
+      - run: cargo build --locked
+      - name: Browser smoke test
+        run: |
+          curl --fail -X PUT http://localhost:5000/browser-tests
+          target/debug/booru-thingy > /tmp/booru-test.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid"' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:8080/readyz; then break; fi
+            sleep 1
+          done
+          python tests/browser_smoke.py
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: booru-thingy:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: docker run --rm booru-thingy:test --help
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
