@@ -12,14 +12,13 @@
 <body data-max-bytes="{{MAX_BYTES}}">
   <header class="masthead"><a class="brand" href="/uploads/new"><span class="brand-mark" aria-hidden="true">b.</span> booru-thingy</a><div class="account"><span id="account-name"></span><button id="logout" class="quiet" hidden>Sign out</button></div></header>
   <main>
-    <section class="intro"><p class="eyebrow">A LITTLE HOME FOR YOUR FINDS</p><h1>Keep the good stuff.</h1><p>Drop in an image, a video, or a link.<br>We’ll take care of the rest.</p></section>
     <section id="login-panel" class="panel login" hidden>
-      <p class="eyebrow">WELCOME BACK</p><h2>Sign in to upload</h2><p class="muted">Use the same login and API key you use in Boorusama.</p>
+      <h2>Sign in to upload</h2>
       <form id="login-form"><label>Login<input name="login" autocomplete="username" required></label><label>API key<input name="api_key" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">Sign in <span aria-hidden="true">↗</span></button><p id="login-error" class="error" role="alert"></p></form>
     </section>
     <div id="workspace" hidden>
       <section class="panel composer">
-        <div class="section-heading"><h2>Add something new</h2><span class="pill">IMAGES & VIDEOS</span></div>
+        <div class="section-heading"><h2>Upload</h2></div>
         <div class="tabs" role="tablist" aria-label="Upload method"><button id="file-tab" role="tab" aria-selected="true" aria-controls="file-panel">Files</button><button id="url-tab" role="tab" aria-selected="false" aria-controls="url-panel">From a link</button></div>
         <form id="upload-form">
           <div id="file-panel" role="tabpanel" aria-labelledby="file-tab">
@@ -28,14 +27,13 @@
           </div>
           <div id="url-panel" role="tabpanel" aria-labelledby="url-tab" hidden><label>Direct media URL<input id="source-url" type="url" placeholder="https://example.com/something-good.webp"></label><p class="field-help">A link to the image or video itself, rather than a web page.</p></div>
           <div class="metadata"><label class="tags-label">Tags <span class="optional">optional</span><input id="tags" autocomplete="off" placeholder="cat very_good_cat" aria-controls="suggestions" aria-expanded="false"><div id="suggestions" class="suggestions" hidden></div><span class="field-help">Separate tags with spaces. Leave blank for <code>tagme</code>.</span></label><fieldset><legend>Rating</legend><div class="rating"><label><input type="radio" name="rating" value="g" checked><span>General</span></label><label><input type="radio" name="rating" value="s"><span>Sensitive</span></label><label><input type="radio" name="rating" value="q"><span>Questionable</span></label><label><input type="radio" name="rating" value="e"><span>Explicit</span></label></div></fieldset><label id="source-label">Source <span class="optional">optional</span><input id="source" type="url" placeholder="Where did you find it?"></label></div>
-          <div class="submit-row"><p>Published automatically.<br><span class="muted">You can edit the details in Boorusama.</span></p><button id="upload-button" class="primary" type="submit">Upload & keep <span aria-hidden="true">↗</span></button></div>
+          <div class="submit-row"><button id="upload-button" class="primary" type="submit">Upload<span aria-hidden="true">↗</span></button></div>
           <div id="transfer" hidden><progress id="progress" max="100" value="0"></progress><p id="transfer-label" class="field-help" role="status"></p></div><p id="upload-error" class="error" role="alert"></p>
         </form>
       </section>
-      <section class="recent"><div class="section-heading"><h2>Recent uploads</h2><span id="queue-status" class="muted" role="status"></span></div><div id="queue"><div class="empty-state"><span aria-hidden="true">✧</span><p>A clean slate.</p><small>Your latest uploads will appear here.</small></div></div><button id="more" class="quiet" hidden>Show older uploads</button></section>
+      <section class="recent"><div class="section-heading"><h2>Recent uploads</h2><span id="queue-status" class="muted" role="status"></span></div><div id="queue"><div class="empty-state"><span aria-hidden="true">✧</span><p>No recent uploads.</p></div></div><button id="more" class="quiet" hidden>Show older uploads</button></section>
     </div>
     <noscript><section class="panel"><h2>JavaScript is needed for this upload page</h2><p>You can also upload through the multipart API at <code>/uploads.json</code>.</p></section></noscript>
   </main>
-  <footer><span>Small backend. Good collection.</span><span>Made for Boorusama.</span></footer>
 </body>
 </html>
