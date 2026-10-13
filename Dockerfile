@@ -2,6 +2,7 @@ FROM rust:1.99-trixie AS build
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY .cargo ./.cargo
 COPY src ./src
 COPY migrations ./migrations

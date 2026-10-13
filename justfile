@@ -13,7 +13,11 @@ lint:
 
 # Requires a running disposable target, test dependencies, Chromium, and ffmpeg.
 e2e:
-  python -m pytest tests/e2e --tracing=retain-on-failure --screenshot=only-on-failure --output=test-results/browser --junitxml=test-results/e2e.xml
+    python -m pytest tests/e2e --tracing=retain-on-failure --screenshot=only-on-failure --output=test-results/browser --junitxml=test-results/e2e.xml
+
+# Requires pytest-playwright and Chromium; no running services required.
+frontend-test:
+    python -m pytest tests/frontend
 
 generate-sql:
   test "$(sqlc version)" = "v1.30.0"

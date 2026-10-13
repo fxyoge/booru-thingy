@@ -46,7 +46,11 @@ jobs:
     - run: cargo clippy --locked --all-targets -- -D warnings
     - run: cargo test --locked
     - run: cargo test --locked -- --ignored
-    - run: node --check assets/app.js
+    - name: Check frontend modules
+      run: |
+        for file in assets/*.js assets/components/*.js; do
+          node --input-type=module --check < "$file"
+        done
 
   image:
     runs-on: ubuntu-latest
@@ -130,6 +134,8 @@ jobs:
         sudo apt-get update && sudo apt-get install -y ffmpeg
         python -m pip install -r tests/e2e/requirements.txt
         python -m playwright install chromium --with-deps
+    - name: Run frontend browser regressions
+      run: python -m pytest tests/frontend --tracing=retain-on-failure --screenshot=only-on-failure --output=test-results/frontend --junitxml=test-results/frontend.xml
     - name: Provision deployment
       # These selectors are not present in the test command's environment.
       env:
