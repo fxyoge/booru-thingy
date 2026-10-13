@@ -306,6 +306,24 @@ async fn upload_objects(app: &App, uploads: Vec<Value>) -> Result<Vec<Value>> {
     if uploads.is_empty() {
         return Ok(Vec::new());
     }
+    let mut items_by_upload = load_upload_items(app, &uploads).await?;
+    let owner = api::owner(app).await?;
+    Ok(uploads
+        .into_iter()
+        .map(|upload| {
+            let id = upload["id"].as_i64().unwrap();
+            serialize_upload(
+                upload,
+                items_by_upload.remove(&id).unwrap_or_default(),
+                &owner,
+            )
+        })
+        .collect())
+}
+async fn load_upload_items(app: &App, uploads: &[Value]) -> Result<HashMap<i64, Vec<Value>>> {
+    if uploads.is_empty() {
+        return Ok(HashMap::new());
+    }
     let ids: Vec<_> = uploads.iter().map(|u| u["id"].as_i64().unwrap()).collect();
     let records = queries::list_upload_items(&app.db, ids).await?;
     let asset_ids: Vec<_> = records
@@ -320,61 +338,57 @@ async fn upload_objects(app: &App, uploads: Vec<Value>) -> Result<Vec<Value>> {
             assets.insert(row.id, api::serialize_asset(app, row.payload).await?);
         }
     }
-    let owner = api::owner(app).await?;
+    let sources: HashMap<_, _> = uploads
+        .iter()
+        .map(|upload| (upload["id"].as_i64().unwrap(), &upload["source"]))
+        .collect();
     let mut items_by_upload: HashMap<_, Vec<_>> = HashMap::new();
     for row in records {
-        items_by_upload.entry(row.upload_id).or_default().push(row);
+        let source = sources[&row.upload_id];
+        items_by_upload
+            .entry(row.upload_id)
+            .or_default()
+            .push(serialize_item(row, source, &assets)?);
     }
-    uploads
-        .into_iter()
-        .map(|upload| {
-            let id = upload["id"].as_i64().unwrap();
-            serialize_upload(
-                upload,
-                items_by_upload.remove(&id).unwrap_or_default(),
-                &assets,
-                &owner,
-            )
-        })
-        .collect()
+    Ok(items_by_upload)
 }
-fn serialize_upload(
-    mut upload: Value,
-    records: Vec<queries::ListUploadItemsRow>,
+fn serialize_item(
+    row: queries::ListUploadItemsRow,
+    source: &Value,
     media_assets: &HashMap<i64, Value>,
-    owner: &Value,
 ) -> Result<Value> {
-    let upload_id = upload["id"].as_i64().unwrap();
-    let mut items = Vec::new();
+    let error = (!row.error.is_empty()).then_some(row.error);
+    let mut item = json!({"id":row.id,"upload_id":row.upload_id,"media_asset_id":row.media_asset_id,"status":row.status,"error":error,"source_url":row.source_url,"page_url":source,"filename":row.filename,"duplicate":row.duplicate,"post_id":row.post_id,"created_at":row.created,"updated_at":row.updated});
+    if let Some(asset_id) = row.media_asset_id {
+        let mut asset = media_assets
+            .get(&asset_id)
+            .ok_or_else(Error::missing)?
+            .clone();
+        if let Some(post_id) = row.post_id {
+            asset["post"] = json!({"id":post_id});
+        }
+        item["media_asset"] = asset;
+    }
+    Ok(item)
+}
+fn serialize_upload(mut upload: Value, items: Vec<Value>, owner: &Value) -> Value {
     let mut assets = Vec::new();
     let mut posts = Vec::new();
     let mut pending = false;
     let mut failed = false;
     let mut errors = Vec::new();
-    for row in records {
-        let status = row.status;
-        pending |= !matches!(status.as_str(), "completed" | "error");
-        failed |= status == "error";
-        let error = (!row.error.is_empty()).then_some(row.error);
-        if let Some(error) = &error {
-            errors.push(error.clone());
+    for item in &items {
+        pending |= !matches!(item["status"].as_str(), Some("completed" | "error"));
+        failed |= item["status"] == "error";
+        if let Some(error) = item["error"].as_str() {
+            errors.push(error);
         }
-        let asset_id = row.media_asset_id;
-        let post_id = row.post_id;
-        let mut item = json!({"id":row.id,"upload_id":upload_id,"media_asset_id":asset_id,"status":status,"error":error,"source_url":row.source_url,"page_url":upload["source"],"filename":row.filename,"duplicate":row.duplicate,"post_id":post_id,"created_at":row.created,"updated_at":row.updated});
-        if let Some(asset_id) = asset_id {
-            let mut asset = media_assets
-                .get(&asset_id)
-                .ok_or_else(Error::missing)?
-                .clone();
-            if let Some(post_id) = post_id {
-                asset["post"] = json!({"id":post_id});
-                posts.push(json!({"id":post_id}));
+        if let Some(asset) = item.get("media_asset") {
+            if let Some(post) = asset.get("post") {
+                posts.push(post.clone());
             }
-            item["media_asset"] = asset.clone();
-            assets.push(asset);
+            assets.push(asset.clone());
         }
-        items.push(item);
     }
     upload["status"] = json!(if pending {
         "processing"
@@ -394,7 +408,7 @@ fn serialize_upload(
     upload["upload_media_assets"] = json!(items);
     upload["media_assets"] = json!(assets);
     upload["posts"] = json!(posts);
-    Ok(upload)
+    upload
 }
 async fn show(State(app): State<App>, Path(value): Path<String>) -> Result<Json<Value>> {
     Ok(Json(upload_object(&app, api::id(&value)?).await?))
@@ -460,16 +474,15 @@ async fn items(State(app): State<App>, Query(params): Query<Params>) -> Result<J
             .map(|row| row.payload)
             .collect()
     };
-    let mut output = Vec::new();
-    for upload in upload_objects(&app, uploads).await? {
-        output.extend(
-            upload["upload_media_assets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .cloned(),
-        );
-    }
+    let mut items_by_upload = load_upload_items(&app, &uploads).await?;
+    let output: Vec<_> = uploads
+        .iter()
+        .flat_map(|upload| {
+            items_by_upload
+                .remove(&upload["id"].as_i64().unwrap())
+                .unwrap_or_default()
+        })
+        .collect();
     Ok(Json(json!(output)))
 }
 async fn retry(State(app): State<App>, Path(value): Path<String>) -> Result<Json<Value>> {

@@ -290,6 +290,19 @@ async fn upload_lists_batch_reads_and_preserve_response_semantics(pool: PgPool) 
         atomic::{AtomicUsize, Ordering},
     };
 
+    fn without_signed_urls(mut item: Value) -> Value {
+        if let Some(variants) = item
+            .get_mut("media_asset")
+            .and_then(|asset| asset.get_mut("variants"))
+            .and_then(Value::as_array_mut)
+        {
+            for variant in variants {
+                variant.as_object_mut().unwrap().remove("url");
+            }
+        }
+        item
+    }
+
     sqlx::raw_sql(
         "INSERT INTO uploads(id,source) OVERRIDING SYSTEM VALUE SELECT id,'https://example.com/' || id FROM generate_series(1,5) id;
         INSERT INTO media_assets(id,sha256,md5,file_ext,content_type,file_size,image_width,image_height,original_key,status)
@@ -410,14 +423,15 @@ async fn upload_lists_batch_reads_and_preserve_response_semantics(pool: PgPool) 
         (
             "/upload_media_assets.json",
             vec![41, 31, 32, 21, 22, 11, 12],
-            4,
+            3,
         ),
         (
             "/upload_media_assets.json?search[upload_id]=1",
             vec![11, 12],
-            4,
+            3,
         ),
-        ("/upload_media_assets.json?search[upload_id]=5", vec![], 3),
+        ("/upload_media_assets.json?search[upload_id]=5", vec![], 2),
+        ("/upload_media_assets.json?limit=1", vec![], 2),
     ] {
         reads.store(0, Ordering::SeqCst);
         let items = get(&routes, path, &auth).await;
@@ -429,6 +443,22 @@ async fn upload_lists_batch_reads_and_preserve_response_semantics(pool: PgPool) 
             .map(|i| i["id"].as_i64().unwrap())
             .collect();
         assert_eq!(actual, ids, "{path}");
+        for item in items.as_array().unwrap() {
+            let expected = uploads
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|upload| upload["upload_media_assets"].as_array().unwrap())
+                .find(|expected| expected["id"] == item["id"])
+                .unwrap();
+            // Signing times may differ; all other item fields must match the
+            // nested upload response, including per-item post attachments.
+            assert_eq!(
+                without_signed_urls(item.clone()),
+                without_signed_urls(expected.clone()),
+                "{path}"
+            );
+        }
     }
     reads.store(0, Ordering::SeqCst);
     let upload = get(&routes, "/uploads/1.json", &auth).await;
