@@ -8,7 +8,7 @@ function node(tag, text, className) { const el = document.createElement(tag); if
 async function api(path, options = {}) {
   const response = await fetch(path, { ...options, headers: { ...options.headers, 'X-CSRF-Token': csrf } });
   const data = await response.json().catch(() => ({ reason: 'Unexpected server response' }));
-  if (!response.ok) { if (response.status === 401) signedOut(); throw new Error(data.reason || `Request failed (${response.status})`); }
+  if (!response.ok) { if (response.status === 401) signedOut(); const error = new Error(data.reason || `Request failed (${response.status})`); error.status = response.status; throw error; }
   return data;
 }
 function signedOut() { $('workspace').hidden = true; $('login-panel').hidden = false; $('logout').hidden = true; $('account-name').textContent = ''; }
@@ -74,7 +74,12 @@ function sendFile(ticket, file, progress) {
     form.append('file', file); // S3 requires the file part last.
     const xhr = new XMLHttpRequest(); xhr.open('POST', ticket.url); xhr.timeout = 900000;
     xhr.upload.onprogress = (event) => { if (event.lengthComputable) progress(Math.min(file.size, event.loaded / event.total * file.size)); };
-    xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Storage upload failed (${xhr.status}). Check storage CORS and upload policy.`));
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) { reject(new Error(`Storage upload failed (${xhr.status}). Check storage CORS and upload policy.`)); return; }
+      const etag = xhr.getResponseHeader('ETag');
+      if (!etag) { reject(new Error('Storage did not expose an ETag. Check storage CORS exposes ETag.')); return; }
+      resolve(etag);
+    };
     xhr.onerror = () => reject(new Error('Storage connection interrupted. Check storage CORS and connectivity.'));
     xhr.ontimeout = () => reject(new Error('Storage transfer timed out.'));
     // Storage receives only its signed fields, never API credentials or cookies.
@@ -85,7 +90,7 @@ async function transferFiles(metadata) {
   const fingerprint = JSON.stringify([metadata, selected.map((item) => item.url)]);
   if (!transferBatch || transferBatch.fingerprint !== fingerprint) {
     const upload = await api('/uploads/direct', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...metadata, files: selected.map(({ file }) => ({ filename: file.name, size: file.size })) }) });
-    transferBatch = { fingerprint, id: upload.id, items: upload.upload_media_assets.map((item, index) => ({ id: item.id, file: selected[index].file, loaded: 0, transferred: false, completed: false })) };
+    transferBatch = { fingerprint, id: upload.id, items: upload.upload_media_assets.map((item, index) => ({ id: item.id, file: selected[index].file, loaded: 0, etag: null, completed: false })) };
   }
   const batch = transferBatch, errors = [], total = batch.items.reduce((sum, item) => sum + item.file.size, 0);
   let cursor = 0;
@@ -95,14 +100,14 @@ async function transferFiles(metadata) {
       const item = batch.items[cursor++]; if (item.completed) continue;
       const path = `/uploads/${batch.id}/items/${item.id}`;
       try {
-        if (!item.transferred) {
+        if (!item.etag) {
           item.loaded = 0;
           const ticket = await api(`${path}/ticket`, { method: 'POST' });
-          await sendFile(ticket, item.file, (loaded) => { item.loaded = loaded; update(); });
-          item.loaded = item.file.size; item.transferred = true;
+          item.etag = await sendFile(ticket, item.file, (loaded) => { item.loaded = loaded; update(); });
+          item.loaded = item.file.size;
         }
-        await api(`${path}/complete`, { method: 'POST' }); item.completed = true; update(); refresh();
-      } catch (error) { errors.push(`${item.file.name}: ${error.message}`); }
+        await api(`${path}/complete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ etag: item.etag }) }); item.completed = true; update(); refresh();
+      } catch (error) { if (error.status === 409) item.etag = null; errors.push(`${item.file.name}: ${error.message}`); }
     }
   };
   await Promise.all([run(), run()]);
@@ -133,11 +138,11 @@ async function refresh() {
       const card = node('div', undefined, 'queue-card'); const title = node('div', undefined, 'queue-title'); title.append(node('span', `Upload #${upload.id}`), node('span', new Date(upload.created_at).toLocaleString())); card.append(title);
       for (const item of upload.upload_media_assets) {
         const row = node('div', undefined, 'queue-item'); const thumb = node('img', undefined, 'queue-thumb'); const preview = item.media_asset?.variants?.find((v) => v.type === '180x180'); if (preview) { thumb.src = preview.url; thumb.alt = ''; } else { thumb.hidden = true; }
-        const text = node('div', undefined, 'queue-text'); text.append(node('strong', item.filename || item.source_url || 'URL import')); text.append(node('small', item.error || (item.post_id ? `${item.duplicate ? 'Already in your collection' : 'Published'} · Post #${item.post_id}` : 'We’re getting it ready.')));
+        const text = node('div', undefined, 'queue-text'); text.append(node('strong', item.filename || item.source_url || 'URL import')); const message = item.error || (item.post_id ? `${item.duplicate ? 'Already in your collection' : 'Published'} · Post #${item.post_id}` : 'We’re getting it ready.'); text.append(node('small', message + (item.status === 'error' && !item.source_url ? ' Select the file again to re-upload.' : '')));
         const labels = { receiving: 'Receiving', pending: 'Queued', processing: 'Processing', completed: item.duplicate ? 'Duplicate' : 'Published', error: 'Failed' }; row.append(thumb, text, node('span', labels[item.status] || item.status, `state${item.status === 'error' ? ' failed' : ''}`)); card.append(row);
       }
       if (!upload.upload_media_assets.length) card.append(node('p', 'Upload was interrupted before any files were received.', 'field-help'));
-      if (upload.status === 'error' || upload.upload_media_assets.some((item) => item.status === 'error')) {
+      if (upload.upload_media_assets.some((item) => item.status === 'error' && item.source_url)) {
         const retry = node('button', 'Retry failed items', 'quiet'); retry.addEventListener('click', async () => { retry.disabled = true; try { await api(`/uploads/${upload.id}/retry`, { method: 'POST' }); refresh(); } catch (error) { $('queue-status').textContent = error.message; } finally { retry.disabled = false; } }); card.append(retry);
       }
       queue.append(card);

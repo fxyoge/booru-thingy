@@ -77,7 +77,7 @@ pub async fn run(app: App, stop: CancellationToken) -> anyhow::Result<()> {
         .register(move |_| {
             WorkerBuilder::new(format!("maintenance-{process_id}"))
                 .backend(apalis_cron::CronScheduler::new(
-                    "0 0 * * * *".parse::<cron::Schedule>().unwrap(),
+                    "0 * * * * *".parse::<cron::Schedule>().unwrap(),
                 ))
                 .data(app.clone())
                 .build(|_: apalis_cron::Tick, app: Data<App>| async move {

@@ -125,18 +125,17 @@ impl Storage {
             "policy": policy, "x-amz-signature": signature
         }})
     }
-    /// Copy only the object observed by HEAD into a key never granted to the client.
-    pub async fn snapshot(
+    pub async fn validate_upload(
         &self,
-        incoming: &str,
-        staging: &str,
+        key: &str,
+        etag: &str,
         expected: i64,
     ) -> anyhow::Result<()> {
         let head = self
             .client
             .head_object()
             .bucket(&self.bucket)
-            .key(incoming)
+            .key(key)
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("uploaded object is not available"))?;
@@ -144,35 +143,9 @@ impl Storage {
             head.content_length() == Some(expected),
             "uploaded object size does not match reservation"
         );
-        let etag = head
-            .e_tag()
-            .ok_or_else(|| anyhow::anyhow!("uploaded object has no ETag"))?;
-        let source = format!("{}/{}", self.bucket, incoming);
-        // Incoming keys are generated ASCII UUID paths. Encode the copy-source path via Url.
-        let mut encoded = url::Url::parse("http://storage.invalid").expect("static URL");
-        encoded.set_path(&source);
-        self.client
-            .copy_object()
-            .bucket(&self.bucket)
-            .key(staging)
-            .copy_source(encoded.path().trim_start_matches('/'))
-            .copy_source_if_match(etag)
-            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
-            .content_type("application/octet-stream")
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("uploaded object changed or snapshot failed"))?;
-        let copied = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(staging)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("upload snapshot is not available"))?;
         anyhow::ensure!(
-            copied.content_length() == Some(expected),
-            "upload snapshot size does not match reservation"
+            head.e_tag() == Some(etag),
+            "uploaded object changed; retry the transfer"
         );
         Ok(())
     }
@@ -202,15 +175,30 @@ impl Storage {
             .map_err(|_| anyhow::anyhow!("object storage write failed"))?;
         Ok(())
     }
-    pub async fn download(&self, key: &str, path: &Path, limit: u64) -> anyhow::Result<()> {
+    pub async fn download(
+        &self,
+        key: &str,
+        path: &Path,
+        limit: u64,
+        etag: Option<&str>,
+    ) -> anyhow::Result<()> {
         let object = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            .set_if_match(etag.map(str::to_owned))
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("object storage read failed"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("object storage read failed: object unavailable or changed")
+            })?;
+        if let Some(etag) = etag {
+            anyhow::ensure!(
+                object.e_tag() == Some(etag),
+                "uploaded object changed; upload file again"
+            );
+        }
         let mut body = object.body;
         let mut file = tokio::fs::File::create(path).await?;
         let mut size = 0_u64;
@@ -219,6 +207,7 @@ impl Storage {
             anyhow::ensure!(size <= limit, "input exceeds upload limit");
             file.write_all(&chunk).await?;
         }
+        file.flush().await?;
         Ok(())
     }
     pub async fn url(&self, key: &str) -> anyhow::Result<String> {

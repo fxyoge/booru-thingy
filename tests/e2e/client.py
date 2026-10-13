@@ -33,7 +33,7 @@ class Client:
             ticket = self.ticket(upload["id"], item["id"])
             response = send_ticket(ticket, name, content)
             assert response.status_code == 204, response.text
-            self.complete(upload["id"], item["id"])
+            self.complete(upload["id"], item["id"], response.headers["etag"])
         return upload
 
     def reserve(self, files, tags="", rating="g", source="", expected=200):
@@ -45,8 +45,9 @@ class Client:
     def ticket(self, upload_id, item_id, expected=200):
         return self.request("POST", f"/uploads/{upload_id}/items/{item_id}/ticket", expected=expected).json()
 
-    def complete(self, upload_id, item_id, expected=200):
-        return self.request("POST", f"/uploads/{upload_id}/items/{item_id}/complete", expected=expected).json()
+    def complete(self, upload_id, item_id, etag='"missing"', expected=200):
+        return self.request("POST", f"/uploads/{upload_id}/items/{item_id}/complete", expected=expected,
+                            json={"etag": etag}).json()
 
     def import_url(self, url, tags="", expected=200):
         return self.request(

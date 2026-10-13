@@ -17,21 +17,12 @@ SELECT count(*)::bigint AS count FROM upload_grants WHERE upload_item_id=sqlc.ar
 SELECT object_key,expires_at FROM upload_grants WHERE upload_item_id=sqlc.arg(upload_item_id) ORDER BY id DESC LIMIT 1;
 
 -- name: AcceptDirectItem :exec
-UPDATE upload_items SET staging_key=sqlc.arg(staging_key),accepted_at=now(),updated_at=now() WHERE id=sqlc.arg(id);
+UPDATE upload_items SET input_key=sqlc.arg(input_key),input_etag=sqlc.arg(input_etag),accepted_at=now(),updated_at=now() WHERE id=sqlc.arg(id);
 
 -- name: ExpiredUploadGrants :many
-SELECT id,object_key FROM upload_grants WHERE expires_at<now()-interval '1 hour' ORDER BY id LIMIT 100;
+SELECT g.id,g.object_key FROM upload_grants g JOIN upload_items i ON i.id=g.upload_item_id
+WHERE g.expires_at<now()-interval '1 hour' AND i.input_key IS DISTINCT FROM g.object_key
+ORDER BY g.id LIMIT 100;
 
 -- name: DeleteUploadGrant :exec
 DELETE FROM upload_grants WHERE id=sqlc.arg(id);
-
--- name: CreateUploadSnapshot :exec
-INSERT INTO upload_snapshots(upload_item_id,object_key) VALUES(sqlc.arg(upload_item_id),sqlc.arg(object_key));
-
--- name: UnusedUploadSnapshots :many
-SELECT s.id,s.object_key FROM upload_snapshots s JOIN upload_items i ON i.id=s.upload_item_id
-WHERE s.created_at<now()-interval '2 hours' AND i.staging_key IS DISTINCT FROM s.object_key
-ORDER BY s.id LIMIT 100;
-
--- name: DeleteUploadSnapshot :exec
-DELETE FROM upload_snapshots WHERE id=sqlc.arg(id);

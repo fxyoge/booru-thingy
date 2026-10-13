@@ -227,10 +227,26 @@ async fn ticket(
     )))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Completion {
+    etag: String,
+}
+
 async fn complete(
     State(app): State<App>,
     Path((upload, item)): Path<(String, String)>,
+    Json(input): Json<Completion>,
 ) -> Result<Json<Value>> {
+    // A single quoted entity tag, not an If-Match wildcard or a list of tags.
+    if !(3..=256).contains(&input.etag.len())
+        || !input.etag.starts_with('"')
+        || !input.etag.ends_with('"')
+        || input.etag[1..input.etag.len() - 1].contains('"')
+        || axum::http::HeaderValue::from_str(&input.etag).is_err()
+    {
+        return Err(Error::bad("pass the ETag returned by storage"));
+    }
     let upload_id = api::id(&upload)?;
     let item_id = api::id(&item)?;
     let mut tx = app.db.begin().await?;
@@ -249,74 +265,34 @@ async fn complete(
         if grant.expires_at + chrono::Duration::hours(1) < chrono::Utc::now() {
             return Err(Error::bad("upload ticket expired; retry the transfer"));
         }
-        let staging = format!("staging/{}", uuid::Uuid::new_v4());
-        queries::create_upload_snapshot(
-            &mut tx,
-            queries::CreateUploadSnapshotParams {
-                upload_item_id: item_id,
-                object_key: &staging,
-            },
-        )
-        .await?;
-        queries::touch_upload_item(&mut tx, item_id).await?;
-        // Persist the unique destination before issuing the copy. A timeout or
-        // crash can leave an object, but can never overwrite another attempt.
-        tx.commit().await?;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
             app.storage
-                .snapshot(&grant.object_key, &staging, row.expected_size.unwrap()),
+                .validate_upload(&grant.object_key, &input.etag, row.expected_size.unwrap()),
         )
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(Error(axum::http::StatusCode::CONFLICT, error.to_string()));
-            }
-            Err(_) => {
-                return Err(Error(
-                    axum::http::StatusCode::CONFLICT,
-                    "upload snapshot timed out; retry completion".into(),
-                ));
-            }
-        }
-        tx = app.db.begin().await?;
-        let current = queries::lock_direct_item(
+        .await
+        .map_err(|_| {
+            Error(
+                axum::http::StatusCode::CONFLICT,
+                "upload verification timed out; retry completion".into(),
+            )
+        })?
+        .map_err(|error| Error(axum::http::StatusCode::CONFLICT, error.to_string()))?;
+        queries::accept_direct_item(
             &mut tx,
-            queries::LockDirectItemParams {
+            queries::AcceptDirectItemParams {
                 id: item_id,
-                upload_id,
+                input_key: Some(&grant.object_key),
+                input_etag: Some(&input.etag),
             },
         )
         .await?;
-        if current.status == "receiving" {
-            let latest = optional(queries::latest_upload_grant(&mut tx, item_id).await)?;
-            if latest.as_ref().map(|g| &g.object_key) != Some(&grant.object_key) {
-                return Err(Error(
-                    axum::http::StatusCode::CONFLICT,
-                    "transfer ticket changed; retry completion".into(),
-                ));
-            }
-            queries::accept_direct_item(
-                &mut tx,
-                queries::AcceptDirectItemParams {
-                    id: item_id,
-                    staging_key: Some(&staging),
-                },
-            )
-            .await?;
-            crate::queue::enqueue(&mut tx, item_id).await?;
-            queries::touch_upload(&mut tx, upload_id).await?;
-        } else if current.accepted_at.is_none() {
-            return Err(Error(
-                axum::http::StatusCode::CONFLICT,
-                "item expired during completion".into(),
-            ));
-        }
+        crate::queue::enqueue(&mut tx, item_id).await?;
+        queries::touch_upload(&mut tx, upload_id).await?;
     } else if row.status == "error" && row.accepted_at.is_none() {
         return Err(Error(
             axum::http::StatusCode::CONFLICT,
-            "item failed; retry transfer or processing".into(),
+            "item expired; upload the file again".into(),
         ));
     }
     tx.commit().await?;

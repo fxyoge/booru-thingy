@@ -77,6 +77,16 @@ def test_browser_shared_url_import(page, api, media, tag, target, sources):
     assert not errors, errors
 
 
+def test_failed_file_requires_reupload_instead_of_processing_retry(page, api, tag, target):
+    upload = api.upload([("corrupt.png", b"not media")], tag)
+    api.await_upload(upload["id"], status="error")
+    page.goto(f"{target['base_url']}/uploads/new")
+    sign_in(page, target)
+    card = page.locator(".queue-card").filter(has=page.get_by_text(f"Upload #{upload['id']}", exact=True))
+    expect(card).to_contain_text("Select the file again to re-upload.")
+    expect(card.get_by_role("button", name="Retry failed items")).to_have_count(0)
+
+
 def test_browser_partial_transfer_retry_preserves_batch_and_keeps_credentials_off_storage(page, api, media, tag, target):
     fixtures = [media(), media("jpg")]
     reservations = []

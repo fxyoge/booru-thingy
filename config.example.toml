@@ -30,6 +30,7 @@ s3_path_style = true
 # Optional client-reachable endpoint for downloads and uploads; defaults to s3_endpoint.
 # Must expose the same bucket, addressing mode, and region.
 # Use HTTPS for an HTTPS application; allow browser POSTs from base_url in storage CORS.
+# Storage CORS must expose the ETag response header for upload completion.
 # s3_public_endpoint = "https://media.example.com"
 # Objects stay private; clients receive signed GET URLs. Bucket access needs object
 # read/write/delete and bucket HEAD permission.

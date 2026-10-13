@@ -139,23 +139,24 @@ pub async fn latest_upload_grant<E: AsExecutor>(
 }
 #[derive(Debug, Clone)]
 pub struct AcceptDirectItemParams<'a> {
-    pub staging_key: Option<&'a str>,
+    pub input_key: Option<&'a str>,
+    pub input_etag: Option<&'a str>,
     pub id: i64,
 }
-pub const ACCEPT_DIRECT_ITEM: &str =
-    "UPDATE upload_items SET staging_key=$1,accepted_at=now(),updated_at=now() WHERE id=$2";
+pub const ACCEPT_DIRECT_ITEM: &str = "UPDATE upload_items SET input_key=$1,input_etag=$2,accepted_at=now(),updated_at=now() WHERE id=$3";
 pub async fn accept_direct_item<E: AsExecutor>(
     mut db: E,
     arg: AcceptDirectItemParams<'_>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(ACCEPT_DIRECT_ITEM)
-        .bind(arg.staging_key)
+        .bind(arg.input_key)
+        .bind(arg.input_etag)
         .bind(arg.id)
         .execute(db.as_executor())
         .await?;
     Ok(())
 }
-pub const EXPIRED_UPLOAD_GRANTS: &str = "SELECT id,object_key FROM upload_grants WHERE expires_at<now()-interval '1 hour' ORDER BY id LIMIT 100";
+pub const EXPIRED_UPLOAD_GRANTS: &str = "SELECT g.id,g.object_key FROM upload_grants g JOIN upload_items i ON i.id=g.upload_item_id\nWHERE g.expires_at<now()-interval '1 hour' AND i.input_key IS DISTINCT FROM g.object_key\nORDER BY g.id LIMIT 100";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExpiredUploadGrantsRow {
     pub id: i64,
@@ -171,45 +172,6 @@ pub async fn expired_upload_grants<E: AsExecutor>(
 pub const DELETE_UPLOAD_GRANT: &str = "DELETE FROM upload_grants WHERE id=$1";
 pub async fn delete_upload_grant<E: AsExecutor>(mut db: E, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query(DELETE_UPLOAD_GRANT)
-        .bind(id)
-        .execute(db.as_executor())
-        .await?;
-    Ok(())
-}
-#[derive(Debug, Clone)]
-pub struct CreateUploadSnapshotParams<'a> {
-    pub upload_item_id: i64,
-    pub object_key: &'a str,
-}
-pub const CREATE_UPLOAD_SNAPSHOT: &str =
-    "INSERT INTO upload_snapshots(upload_item_id,object_key) VALUES($1,$2)";
-pub async fn create_upload_snapshot<E: AsExecutor>(
-    mut db: E,
-    arg: CreateUploadSnapshotParams<'_>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(CREATE_UPLOAD_SNAPSHOT)
-        .bind(arg.upload_item_id)
-        .bind(arg.object_key)
-        .execute(db.as_executor())
-        .await?;
-    Ok(())
-}
-pub const UNUSED_UPLOAD_SNAPSHOTS: &str = "SELECT s.id,s.object_key FROM upload_snapshots s JOIN upload_items i ON i.id=s.upload_item_id\nWHERE s.created_at<now()-interval '2 hours' AND i.staging_key IS DISTINCT FROM s.object_key\nORDER BY s.id LIMIT 100";
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct UnusedUploadSnapshotsRow {
-    pub id: i64,
-    pub object_key: String,
-}
-pub async fn unused_upload_snapshots<E: AsExecutor>(
-    mut db: E,
-) -> Result<Vec<UnusedUploadSnapshotsRow>, sqlx::Error> {
-    sqlx::query_as::<_, UnusedUploadSnapshotsRow>(UNUSED_UPLOAD_SNAPSHOTS)
-        .fetch_all(db.as_executor())
-        .await
-}
-pub const DELETE_UPLOAD_SNAPSHOT: &str = "DELETE FROM upload_snapshots WHERE id=$1";
-pub async fn delete_upload_snapshot<E: AsExecutor>(mut db: E, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(DELETE_UPLOAD_SNAPSHOT)
         .bind(id)
         .execute(db.as_executor())
         .await?;
@@ -844,7 +806,7 @@ pub async fn list_uploads<E: AsExecutor>(
         .fetch_all(db.as_executor())
         .await
 }
-pub const LOCK_RETRY_UPLOAD_ITEMS: &str = "SELECT i.id FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.upload_id=$1 AND s.status='error'\nAND (i.staging_key IS NOT NULL OR i.source_url <> '')\nAND (i.expected_size IS NULL OR i.accepted_at IS NOT NULL) FOR UPDATE OF i";
+pub const LOCK_RETRY_UPLOAD_ITEMS: &str = "SELECT i.id FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.upload_id=$1 AND s.status='error'\nAND i.expected_size IS NULL AND i.source_url <> '' FOR UPDATE OF i";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LockRetryUploadItemsRow {
     pub id: i64,
@@ -891,12 +853,13 @@ pub async fn get_upload_item_state<E: AsExecutor>(
         .fetch_one(db.as_executor())
         .await
 }
-pub const GET_PROCESSING_ITEM: &str =
-    "SELECT source_url,staging_key,task_id,post_id FROM upload_items WHERE id=$1";
+pub const GET_PROCESSING_ITEM: &str = "SELECT source_url,input_key,input_etag,expected_size,task_id,post_id FROM upload_items WHERE id=$1";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GetProcessingItemRow {
     pub source_url: String,
-    pub staging_key: Option<String>,
+    pub input_key: Option<String>,
+    pub input_etag: Option<String>,
+    pub expected_size: Option<i64>,
     pub task_id: Option<String>,
     pub post_id: Option<i64>,
 }
@@ -957,37 +920,35 @@ pub async fn touch_upload<E: AsExecutor>(mut db: E, id: i64) -> Result<(), sqlx:
         .await?;
     Ok(())
 }
-pub const LIST_STAGING_CLEANUP_CANDIDATES: &str =
-    "SELECT id FROM upload_items WHERE staging_key IS NOT NULL AND post_id IS NOT NULL LIMIT 100";
+pub const LIST_INPUT_CLEANUP_CANDIDATES: &str = "SELECT i.id FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.input_key IS NOT NULL AND s.status IN ('completed','error') LIMIT 100";
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ListStagingCleanupCandidatesRow {
+pub struct ListInputCleanupCandidatesRow {
     pub id: i64,
 }
-pub async fn list_staging_cleanup_candidates<E: AsExecutor>(
+pub async fn list_input_cleanup_candidates<E: AsExecutor>(
     mut db: E,
-) -> Result<Vec<ListStagingCleanupCandidatesRow>, sqlx::Error> {
-    sqlx::query_as::<_, ListStagingCleanupCandidatesRow>(LIST_STAGING_CLEANUP_CANDIDATES)
+) -> Result<Vec<ListInputCleanupCandidatesRow>, sqlx::Error> {
+    sqlx::query_as::<_, ListInputCleanupCandidatesRow>(LIST_INPUT_CLEANUP_CANDIDATES)
         .fetch_all(db.as_executor())
         .await
 }
-pub const LOCK_STAGING_CLEANUP_ITEM: &str =
-    "SELECT staging_key FROM upload_items WHERE id=$1 AND post_id IS NOT NULL FOR UPDATE";
+pub const LOCK_INPUT_CLEANUP_ITEM: &str = "SELECT i.input_key FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.id=$1 AND s.status IN ('completed','error') FOR UPDATE OF i";
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct LockStagingCleanupItemRow {
-    pub staging_key: Option<String>,
+pub struct LockInputCleanupItemRow {
+    pub input_key: Option<String>,
 }
-pub async fn lock_staging_cleanup_item<E: AsExecutor>(
+pub async fn lock_input_cleanup_item<E: AsExecutor>(
     mut db: E,
     id: i64,
-) -> Result<LockStagingCleanupItemRow, sqlx::Error> {
-    sqlx::query_as::<_, LockStagingCleanupItemRow>(LOCK_STAGING_CLEANUP_ITEM)
+) -> Result<LockInputCleanupItemRow, sqlx::Error> {
+    sqlx::query_as::<_, LockInputCleanupItemRow>(LOCK_INPUT_CLEANUP_ITEM)
         .bind(id)
         .fetch_one(db.as_executor())
         .await
 }
-pub const CLEAR_STAGING_KEY: &str = "UPDATE upload_items SET staging_key=NULL WHERE id=$1";
-pub async fn clear_staging_key<E: AsExecutor>(mut db: E, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(CLEAR_STAGING_KEY)
+pub const CLEAR_INPUT: &str = "UPDATE upload_items SET input_key=NULL,input_etag=NULL WHERE id=$1";
+pub async fn clear_input<E: AsExecutor>(mut db: E, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(CLEAR_INPUT)
         .bind(id)
         .execute(db.as_executor())
         .await?;

@@ -60,8 +60,9 @@ def test_superseded_tickets_do_not_select_the_old_object(api):
     assert latest["fields"]["key"] != old["fields"]["key"]
     assert send_ticket(old, "image.png", b"not media").status_code == 204
     api.complete(upload, item, expected=409)  # Only the newest reservation is selected.
-    assert send_ticket(latest, "image.png", b"not media").status_code == 204
-    api.complete(upload, item)
+    response = send_ticket(latest, "image.png", b"not media")
+    assert response.status_code == 204
+    api.complete(upload, item, response.headers["etag"])
 
 
 def test_expired_ticket_rejects_transfer_and_can_be_replaced(api):
@@ -73,8 +74,32 @@ def test_expired_ticket_rejects_transfer_and_can_be_replaced(api):
     assert response.status_code in (400, 403), response.text
     api.complete(upload, item, expected=409)
     replacement = api.ticket(upload, item)
-    assert send_ticket(replacement, "image.png", b"not media").status_code == 204
-    api.complete(upload, item)
+    response = send_ticket(replacement, "image.png", b"not media")
+    assert response.status_code == 204
+    api.complete(upload, item, response.headers["etag"])
+
+
+@pytest.mark.parametrize("etag", ["", "*", '"one", "two"', '"bad\r\nvalue"', 'W/"weak"'])
+def test_completion_requires_a_single_storage_etag(api, etag):
+    upload, item, _ = reserved(api)
+    api.complete(upload, item, etag, expected=400)
+
+
+def test_completion_rejects_a_replaced_object(api, media, tag):
+    fixture = media()
+    content = fixture.read_bytes()
+    upload = api.reserve([(fixture.name, content)], tag)
+    item = upload["upload_media_assets"][0]["id"]
+    ticket = api.ticket(upload["id"], item)
+    response = send_ticket(ticket, fixture.name, content)
+    assert response.status_code == 204
+    etag = response.headers["etag"]
+    replacement = send_ticket(ticket, fixture.name, b"x" * len(content))
+    assert replacement.status_code == 204 and replacement.headers["etag"] != etag
+    error = api.complete(upload["id"], item, etag, expected=409)
+    assert "changed" in error["reason"]
+    assert api.get(f"/uploads/{upload['id']}.json")["upload_media_assets"][0]["status"] == "receiving"
+    assert api.count(tag) == 0
 
 
 def test_completion_is_concurrent_and_idempotent_and_replay_cannot_change_media(api, media, tag, target):
@@ -83,23 +108,25 @@ def test_completion_is_concurrent_and_idempotent_and_replay_cannot_change_media(
     upload = api.reserve([(fixture.name, content)], tag)
     item = upload["upload_media_assets"][0]["id"]
     ticket = api.ticket(upload["id"], item)
-    assert send_ticket(ticket, fixture.name, content).status_code == 204
+    response = send_ticket(ticket, fixture.name, content)
+    assert response.status_code == 204
+    etag = response.headers["etag"]
 
     def complete(_):
         client = Client(target["base_url"], target["login"], target["key"])
         try:
-            return client.complete(upload["id"], item)
+            return client.complete(upload["id"], item, etag)
         finally:
             client.http.close()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         list(executor.map(complete, range(4)))
-    # A valid, unexpired grant can still overwrite incoming, but not the snapshot.
-    assert send_ticket(ticket, fixture.name, b"x" * len(content)).status_code == 204
     result = api.await_upload(upload["id"])
+    # Replaying a ticket after publication cannot change the permanent original.
+    assert send_ticket(ticket, fixture.name, b"x" * len(content)).status_code == 204
     post = api.get(f"/posts/{result['upload_media_assets'][0]['post_id']}.json")
     assert_original(post, fixture)
-    api.complete(upload["id"], item)
+    api.complete(upload["id"], item, etag)
     api.ticket(upload["id"], item, expected=409)
     assert api.count(tag) == 1
 

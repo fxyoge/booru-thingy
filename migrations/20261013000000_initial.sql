@@ -81,13 +81,15 @@ CREATE TABLE upload_items (
     upload_id bigint NOT NULL REFERENCES uploads(id),
     filename text NOT NULL DEFAULT '',
     source_url text NOT NULL DEFAULT '',
-    staging_key text,
+    input_key text,
+    input_etag text,
     task_id text,
     media_asset_id bigint REFERENCES media_assets(id),
     post_id bigint REFERENCES posts(id),
     duplicate boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((input_key IS NULL) = (input_etag IS NULL))
 );
 CREATE INDEX upload_items_upload ON upload_items(upload_id);
 CREATE TABLE web_sessions (

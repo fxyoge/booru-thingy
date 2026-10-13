@@ -15,11 +15,24 @@ pub async fn process(app: &App, item_id: i64, task_id: &str) -> anyhow::Result<(
     }
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("input");
-    if let Some(key) = &row.staging_key {
+    if let Some(key) = &row.input_key {
         app.storage
-            .download(key, &path, app.config.max_upload_bytes)
+            .download(
+                key,
+                &path,
+                app.config.max_upload_bytes,
+                row.input_etag.as_deref(),
+            )
             .await?;
+        anyhow::ensure!(
+            tokio::fs::metadata(&path).await?.len() == row.expected_size.unwrap() as u64,
+            "uploaded object size does not match reservation"
+        );
     } else {
+        anyhow::ensure!(
+            row.expected_size.is_none(),
+            "upload file again; temporary input was removed"
+        );
         fetch(app, &row.source_url, &path).await?;
     }
     let metadata = media::inspect(&path).await?;
@@ -197,33 +210,29 @@ pub async fn fetch(app: &App, source: &str, path: &Path) -> anyhow::Result<()> {
             file.write_all(&chunk).await?;
         }
         anyhow::ensure!(size > 0, "source returned an empty file");
+        file.flush().await?;
         return Ok(());
     }
     anyhow::bail!("too many source redirects")
 }
 pub(crate) async fn cleanup(app: &App) -> anyhow::Result<()> {
     queries::delete_expired_sessions(&app.db).await?;
-    for grant in queries::expired_upload_grants(&app.db).await? {
-        // Keep capabilities tracked until expiry + grace: deleting sooner allows replay
-        // to recreate an object after its tracking record has disappeared.
-        app.storage.delete(&grant.object_key).await?;
-        queries::delete_upload_grant(&app.db, grant.id).await?;
-    }
-    for snapshot in queries::unused_upload_snapshots(&app.db).await? {
-        app.storage.delete(&snapshot.object_key).await?;
-        queries::delete_upload_snapshot(&app.db, snapshot.id).await?;
-    }
-    // Failed inputs remain available for manual retries. Only publication makes
-    // the accepted snapshot redundant with the hash-addressed original.
-    for row in queries::list_staging_cleanup_candidates(&app.db).await? {
+    // Keep input only while Apalis can still retry it automatically.
+    for row in queries::list_input_cleanup_candidates(&app.db).await? {
         let mut tx = app.db.begin().await?;
-        let key = optional(queries::lock_staging_cleanup_item(&mut tx, row.id).await)?
-            .and_then(|row| row.staging_key);
+        let key = optional(queries::lock_input_cleanup_item(&mut tx, row.id).await)?
+            .and_then(|row| row.input_key);
         if let Some(key) = key {
             app.storage.delete(&key).await?;
-            queries::clear_staging_key(&mut tx, row.id).await?;
+            queries::clear_input(&mut tx, row.id).await?;
         }
         tx.commit().await?;
+    }
+    for grant in queries::expired_upload_grants(&app.db).await? {
+        // An unexpired ticket can recreate a deleted object. Keep the grant
+        // tracked and delete again after expiry + grace, never while input is active.
+        app.storage.delete(&grant.object_key).await?;
+        queries::delete_upload_grant(&app.db, grant.id).await?;
     }
     Ok(())
 }

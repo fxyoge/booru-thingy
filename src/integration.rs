@@ -8,6 +8,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
+use sha2::Digest;
 use sqlx::PgPool;
 use std::{path::Path, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -107,40 +108,56 @@ async fn upload(router: &Router, auth: &str, files: &[(String, Vec<u8>)], tags: 
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{ticket}");
-        let mut multipart = Vec::new();
-        for (key, value) in ticket["fields"].as_object().unwrap() {
-            multipart.extend_from_slice(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{}\r\n",value.as_str().unwrap()).as_bytes());
-        }
-        multipart.extend_from_slice(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
-        multipart.extend_from_slice(data);
-        multipart.extend_from_slice(b"\r\n--test-boundary--\r\n");
-        let response = reqwest::Client::new()
-            .post(ticket["url"].as_str().unwrap())
-            .header(
-                "content-type",
-                "multipart/form-data; boundary=test-boundary",
-            )
-            .body(multipart)
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            response.status().is_success(),
-            "{}",
-            response.text().await.unwrap()
-        );
+        let etag = transfer(&ticket, name, data).await;
         let (status, _, result) = request(
             router,
             "POST",
             &format!("{path}/complete"),
-            vec![],
-            "",
+            json!({"etag":etag}).to_string().into_bytes(),
+            "application/json",
             &[("authorization", auth)],
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{result}");
     }
     body
+}
+async fn transfer(ticket: &Value, name: &str, data: &[u8]) -> String {
+    let mut multipart = Vec::new();
+    for (key, value) in ticket["fields"].as_object().unwrap() {
+        multipart.extend_from_slice(
+            format!(
+                "--test-boundary\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{}\r\n",
+                value.as_str().unwrap()
+            )
+            .as_bytes(),
+        );
+    }
+    multipart.extend_from_slice(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+    multipart.extend_from_slice(data);
+    multipart.extend_from_slice(b"\r\n--test-boundary--\r\n");
+    let response = reqwest::Client::new()
+        .post(ticket["url"].as_str().unwrap())
+        .header(
+            "content-type",
+            "multipart/form-data; boundary=test-boundary",
+        )
+        .body(multipart)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    // Moto omits POST's ETag header. Its single-part test objects use the known
+    // fixture MD5 as the validator; real providers return it in the response.
+    response
+        .headers()
+        .get("etag")
+        .map(|etag| etag.to_str().unwrap().to_owned())
+        .unwrap_or_else(|| format!("\"{:x}\"", md5::Md5::digest(data)))
 }
 async fn await_upload(router: &Router, auth: &str, id: i64) -> Value {
     tokio::time::timeout(Duration::from_secs(90), async {
@@ -556,6 +573,7 @@ async fn publication_failure_repeats_media_work_and_manual_retry_gets_a_fresh_ta
             &format!("media/{}/v1/180x180.jpg", metadata.sha256),
             &directory.path().join("preview"),
             1_000_000,
+            None,
         )
         .await
         .unwrap();
@@ -570,6 +588,146 @@ async fn publication_failure_repeats_media_work_and_manual_retry_gets_a_fresh_ta
     stop.cancel();
     workers.await.unwrap().unwrap();
     server.abort();
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "requires PostgreSQL, an S3 test endpoint, ffmpeg, and libvips"]
+async fn changed_input_fails_conditional_get_and_terminal_cleanup_removes_it(pool: PgPool) {
+    let config = std::sync::Arc::new(Config {
+        owner_api_key: "test-key".into(),
+        s3_endpoint: std::env::var("TEST_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
+        s3_bucket: format!("test-{}", uuid::Uuid::new_v4()),
+        aws_access_key_id: std::env::var("TEST_S3_ACCESS_KEY")
+            .unwrap_or_else(|_| "local-access-key".into()),
+        aws_secret_access_key: std::env::var("TEST_S3_SECRET_KEY")
+            .unwrap_or_else(|_| "local-secret-key".into()),
+        ..Config::default()
+    });
+    let app = App {
+        storage: Storage::new(&config).unwrap(),
+        config,
+        db: pool.clone(),
+    };
+    app.storage.create_test_bucket().await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.png");
+    generate(&path, "png").await;
+    let bytes = tokio::fs::read(&path).await.unwrap();
+    let routes = router(app.clone());
+    let auth = format!("Basic {}", STANDARD.encode("owner:test-key"));
+    // No workers yet, so completion cannot race the overwrite below.
+    let accepted = upload(
+        &routes,
+        &auth,
+        &[("image.png".into(), bytes.clone())],
+        "tagme",
+    )
+    .await;
+    let upload_id = accepted["id"].as_i64().unwrap();
+    let item_id = accepted["upload_media_assets"][0]["id"].as_i64().unwrap();
+    let input = queries::get_processing_item(&pool, item_id).await.unwrap();
+    let key = input.input_key.unwrap();
+    let etag = input.input_etag.unwrap();
+    let task_id = input.task_id.unwrap();
+    // Expired tickets must not make queued or retryable input eligible for deletion.
+    sqlx::query("UPDATE upload_grants SET expires_at=now()-interval '2 hours'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    worker::cleanup(&app).await.unwrap();
+    app.storage
+        .download(&key, &path, 2_097_152, Some(&etag))
+        .await
+        .unwrap();
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
+    sqlx::query("UPDATE apalis.jobs SET status='Failed',attempts=1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    worker::cleanup(&app).await.unwrap();
+    assert!(
+        queries::get_processing_item(&pool, item_id)
+            .await
+            .unwrap()
+            .input_key
+            .is_some()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM upload_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("UPDATE apalis.jobs SET status='Pending',attempts=0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Same size, different bytes: If-Match must reject the GET before inspection.
+    tokio::fs::write(&path, vec![b'x'; bytes.len()])
+        .await
+        .unwrap();
+    app.storage
+        .put(&key, &path, "application/octet-stream")
+        .await
+        .unwrap();
+    let error = worker::process(&app, item_id, &task_id).await.unwrap_err();
+    assert!(error.to_string().contains("changed"), "{error}");
+    let stop = CancellationToken::new();
+    let workers = tokio::spawn(queue::run(app.clone(), stop.clone()));
+    let failed = await_upload(&routes, &auth, upload_id).await;
+    assert_eq!(failed["status"], "error", "{failed}");
+    assert!(failed["error"].as_str().unwrap().contains("changed"));
+    stop.cancel();
+    workers.await.unwrap().unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempts FROM apalis.jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        3
+    );
+    worker::cleanup(&app).await.unwrap();
+    let cleared = queries::get_processing_item(&pool, item_id).await.unwrap();
+    assert!(cleared.input_key.is_none() && cleared.input_etag.is_none());
+    assert!(
+        app.storage
+            .download(&key, &path, 2_097_152, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM upload_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let (status, _, _) = request(
+        &routes,
+        "POST",
+        &format!("/uploads/{upload_id}/retry"),
+        vec![],
+        "",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apalis.jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[sqlx::test(migrator = "crate::db::MIGRATOR")]
@@ -741,8 +899,7 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
             .iter()
             .all(|v| v["width"].as_i64().unwrap() > 0 && v["height"].as_i64().unwrap() > 0)
     );
-    // Simulate a crash after object-copy, before the DB completion commit. The
-    // orphaned copy is tracked; retrying uses a different immutable destination.
+    // Completion binds the original incoming object directly to its ETag.
     let (status, _, recovery) = request(
         &routes,
         "POST",
@@ -767,60 +924,32 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK);
     let incoming = recovery_ticket["fields"]["key"].as_str().unwrap();
-    let temp = tempfile::NamedTempFile::new().unwrap();
-    tokio::fs::write(temp.path(), &files[1].1).await.unwrap();
-    app.storage
-        .put(incoming, temp.path(), "application/octet-stream")
-        .await
-        .unwrap();
-    let staging = format!("staging/{}", uuid::Uuid::new_v4());
-    queries::create_upload_snapshot(
-        &pool,
-        queries::CreateUploadSnapshotParams {
-            upload_item_id: recovery_item,
-            object_key: &staging,
-        },
-    )
-    .await
-    .unwrap();
-    app.storage
-        .snapshot(incoming, &staging, files[1].1.len() as i64)
-        .await
-        .unwrap();
+    let etag = transfer(&recovery_ticket, "recovery.png", &files[1].1).await;
     let (status, _, _) = request(
         &routes,
         "POST",
         &format!("/uploads/{recovery_id}/items/{recovery_item}/complete"),
-        vec![],
-        "",
+        json!({"etag":etag}).to_string().into_bytes(),
+        "application/json",
         &[("authorization", &auth)],
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let accepted: String = sqlx::query_scalar("SELECT staging_key FROM upload_items WHERE id=$1")
-        .bind(recovery_item)
-        .fetch_one(&pool)
+    let accepted = queries::get_processing_item(&pool, recovery_item)
         .await
         .unwrap();
-    assert_ne!(accepted, staging);
-    // Model the timed-out first copy completing late with different bytes.
-    tokio::fs::write(temp.path(), vec![b'x'; files[1].1.len()])
-        .await
-        .unwrap();
-    app.storage
-        .put(&staging, temp.path(), "application/octet-stream")
-        .await
-        .unwrap();
-    app.storage
-        .download(&accepted, temp.path(), 2097152)
-        .await
-        .unwrap();
-    assert_eq!(tokio::fs::read(temp.path()).await.unwrap(), files[1].1);
+    if let Some(key) = accepted.input_key {
+        assert_eq!(key, incoming);
+    } else {
+        assert!(accepted.post_id.is_some()); // A scheduled cleanup may already have run.
+    }
     assert_eq!(
         await_upload(&routes, &auth, recovery_id).await["status"],
         "completed"
     );
-    // Unexpired capabilities stay tracked even after publication and cleanup.
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    // Unexpired capabilities stay tracked even after input deletion, so replay
+    // can be cleaned up again after expiry.
     worker::cleanup(&app).await.unwrap();
     let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_grants WHERE object_key=$1")
         .bind(incoming)
@@ -828,27 +957,17 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(grants, 1);
-    sqlx::query(
-        "UPDATE upload_snapshots SET created_at=now()-interval '3 hours' WHERE object_key=$1",
-    )
-    .bind(&staging)
-    .execute(&pool)
-    .await
-    .unwrap();
-    worker::cleanup(&app).await.unwrap();
     assert!(
         app.storage
-            .download(&staging, temp.path(), 2097152)
+            .download(incoming, temp.path(), 2097152, None)
             .await
             .is_err()
     );
-    let snapshots: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM upload_snapshots WHERE object_key=$1")
-            .bind(&staging)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(snapshots, 0);
+    let cleared = queries::get_processing_item(&pool, recovery_item)
+        .await
+        .unwrap();
+    assert!(cleared.input_key.is_none() && cleared.input_etag.is_none());
+    transfer(&recovery_ticket, "recovery.png", &files[1].1).await;
     sqlx::query("UPDATE upload_grants SET expires_at=now()-interval '2 hours' WHERE object_key=$1")
         .bind(incoming)
         .execute(&pool)
@@ -863,7 +982,7 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
     assert_eq!(grants, 0);
     assert!(
         app.storage
-            .download(incoming, temp.path(), 2097152)
+            .download(incoming, temp.path(), 2097152, None)
             .await
             .is_err()
     );
@@ -952,6 +1071,28 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
     let failed = await_upload(&routes, &auth, invalid["id"].as_i64().unwrap()).await;
     assert_eq!(failed["status"], "error");
     assert!(failed["error"].as_str().unwrap().contains("unsupported"));
+    let invalid_item = failed["upload_media_assets"][0]["id"].as_i64().unwrap();
+    let invalid_key: String = sqlx::query_scalar(
+        "SELECT object_key FROM upload_grants WHERE upload_item_id=$1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(invalid_item)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    worker::cleanup(&app).await.unwrap();
+    assert!(
+        app.storage
+            .download(&invalid_key, temp.path(), 2_097_152, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        queries::get_processing_item(&pool, invalid_item)
+            .await
+            .unwrap()
+            .input_key
+            .is_none()
+    );
 
     assert_eq!(
         get(&routes, "/users/1/uploads.json?search[status]=error", &auth)
