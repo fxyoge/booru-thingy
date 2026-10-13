@@ -96,7 +96,7 @@ async fn create(State(app): State<App>, request: Request) -> Result<Json<Value>>
         },
     )
     .await?;
-    crate::worker::enqueue(&mut tx, item.id).await?;
+    crate::queue::enqueue(&mut tx, item.id).await?;
     tx.commit().await?;
     Ok(Json(upload_object(&app, upload_id).await?))
 }
@@ -305,7 +305,7 @@ async fn complete(
                 },
             )
             .await?;
-            crate::worker::enqueue(&mut tx, item_id).await?;
+            crate::queue::enqueue(&mut tx, item_id).await?;
             queries::touch_upload(&mut tx, upload_id).await?;
         } else if current.accepted_at.is_none() {
             return Err(Error(
@@ -506,7 +506,7 @@ async fn retry(State(app): State<App>, Path(value): Path<String>) -> Result<Json
             .status
             == "error"
         {
-            crate::worker::enqueue(&mut tx, item.id).await?;
+            crate::queue::enqueue(&mut tx, item.id).await?;
         }
     }
     tx.commit().await?;

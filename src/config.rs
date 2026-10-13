@@ -129,14 +129,14 @@ pub struct Config {
         layer_attr(arg(long, global = true))
     )]
     pub max_upload_bytes: u64,
-    /// Concurrent workflow steps per worker process.
+    /// Concurrent uploads per worker process.
     #[config(
         env = "WORKER_CONCURRENCY",
         default = 2,
         layer_attr(arg(long, global = true))
     )]
     pub worker_concurrency: usize,
-    /// Deadline per workflow step attempt, in seconds.
+    /// Deadline per upload attempt, in seconds.
     #[config(
         env = "PROCESS_TIMEOUT_SECONDS",
         default = 300u64,

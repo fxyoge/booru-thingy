@@ -1,12 +1,12 @@
 use crate::App;
 use md5::Md5;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::{io::AsyncReadExt, process::Command};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug)]
 pub struct Metadata {
     pub sha256: String,
     pub md5: String,
@@ -17,7 +17,7 @@ pub struct Metadata {
     pub duration: Option<f64>,
     pub size: i64,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Variant {
     pub kind: String,
     pub key: String,

@@ -6,6 +6,7 @@ mod error;
 #[cfg(test)]
 mod integration;
 mod media;
+mod queue;
 mod search;
 mod storage;
 mod uploads;
@@ -84,14 +85,13 @@ async fn main() -> anyhow::Result<()> {
     };
     let workers = async {
         if cli.command != Some(Command::Serve) {
-            worker::run(app.clone(), stop.clone()).await?;
+            queue::run(app.clone(), stop.clone()).await?;
         } else {
             stop.cancelled().await;
         }
         Ok::<_, anyhow::Error>(())
     };
-    // A failed workflow runtime must fail the process, not leave an API accepting
-    // uploads with no functioning workers. Both futures are owned by this scope.
+    // Both the server and worker runtime are owned by this scope.
     let outcome = tokio::try_join!(server, workers);
     stop.cancel();
     app.db.close().await;

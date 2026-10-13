@@ -1,4 +1,6 @@
-use crate::{App, config::Config, db::generated as queries, router, storage::Storage, worker};
+use crate::{
+    App, config::Config, db::generated as queries, queue, router, storage::Storage, worker,
+};
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -282,15 +284,19 @@ async fn upload_lists_batch_reads_and_preserve_response_semantics(pool: PgPool) 
               (2,'original','media/two/original.jpg','jpg','image/jpeg',80,60,200);
         INSERT INTO posts(id,media_asset_id) VALUES(1,1),(2,2);
         INSERT INTO favorites(post_id) VALUES(1);
-        INSERT INTO upload_items(id,upload_id,filename,status,media_asset_id,post_id,duplicate,error)
+        INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,last_result)
+        VALUES('failed-22','uploads','0','Failed',3,3,jsonb_build_object('Err','invalid media')),
+              ('pending-32','uploads','0','Failed',1,3,jsonb_build_object('Err','retrying')),
+              ('failed-41','uploads','0','Failed',3,3,jsonb_build_object('Err','download failed'));
+        INSERT INTO upload_items(id,upload_id,filename,task_id,media_asset_id,post_id,duplicate)
         OVERRIDING SYSTEM VALUE
-        VALUES(11,1,'first.png','completed',1,1,false,NULL),
-              (12,1,'duplicate.png','completed',1,1,true,NULL),
-              (21,2,'second.jpg','completed',2,2,false,NULL),
-              (22,2,'broken.png','error',NULL,NULL,false,'invalid media'),
-              (31,3,'receiving.png','receiving',NULL,NULL,false,NULL),
-              (32,3,'pending.png','pending',1,NULL,false,'retrying'),
-              (41,4,'failed.png','error',NULL,NULL,false,'download failed');",
+        VALUES(11,1,'first.png',NULL,1,1,false),
+              (12,1,'duplicate.png',NULL,1,1,true),
+              (21,2,'second.jpg',NULL,2,2,false),
+              (22,2,'broken.png','failed-22',NULL,NULL,false),
+              (31,3,'receiving.png',NULL,NULL,NULL,false),
+              (32,3,'pending.png','pending-32',1,NULL,false),
+              (41,4,'failed.png','failed-41',NULL,NULL,false);",
     )
     .execute(&pool)
     .await
@@ -355,7 +361,7 @@ async fn upload_lists_batch_reads_and_preserve_response_semantics(pool: PgPool) 
     assert!(uploads[0]["error"].is_null());
     assert_eq!(uploads[1]["error"], "download failed");
     assert_eq!(uploads[2]["status"], "processing");
-    assert_eq!(uploads[2]["error"], "retrying");
+    assert!(uploads[2]["error"].is_null()); // Retryable queue errors are not terminal upload errors.
     assert_eq!(uploads[3]["status"], "error"); // Mixed success/failure.
     assert_eq!(uploads[3]["media_asset_count"], 1);
     let completed = &uploads[4];
@@ -427,6 +433,143 @@ async fn upload_lists_batch_reads_and_preserve_response_semantics(pool: PgPool) 
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
     app_pool.close().await;
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "requires PostgreSQL, an S3 test endpoint, ffmpeg, and libvips"]
+async fn publication_failure_repeats_media_work_and_manual_retry_gets_a_fresh_task(pool: PgPool) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let config = Arc::new(Config {
+        owner_api_key: "test-key".into(),
+        s3_endpoint: std::env::var("TEST_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
+        s3_bucket: format!("test-{}", uuid::Uuid::new_v4()),
+        aws_access_key_id: std::env::var("TEST_S3_ACCESS_KEY")
+            .unwrap_or_else(|_| "local-access-key".into()),
+        aws_secret_access_key: std::env::var("TEST_S3_SECRET_KEY")
+            .unwrap_or_else(|_| "local-secret-key".into()),
+        allow_private_source_urls: true,
+        ..Config::default()
+    });
+    let app = App {
+        storage: Storage::new(&config).unwrap(),
+        config,
+        db: pool.clone(),
+    };
+    app.storage.create_test_bucket().await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.png");
+    generate(&path, "png").await;
+    let metadata = crate::media::inspect(&path).await.unwrap();
+    let bytes = tokio::fs::read(&path).await.unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source = format!("http://{}/image", listener.local_addr().unwrap());
+    let source_routes = Router::new().route(
+        "/image",
+        axum::routing::get({
+            let requests = requests.clone();
+            move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let bytes = bytes.clone();
+                async move { bytes }
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, source_routes).await.unwrap() });
+    let routes = router(app.clone());
+    let auth = format!("Basic {}", STANDARD.encode("owner:test-key"));
+    let (status, _, accepted) = request(
+        &routes,
+        "POST",
+        "/uploads.json",
+        json!({"upload":{"source":source}}).to_string().into_bytes(),
+        "application/json",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = accepted["id"].as_i64().unwrap();
+    let item_id = accepted["upload_media_assets"][0]["id"].as_i64().unwrap();
+    let old_task = queries::get_processing_item(&pool, item_id)
+        .await
+        .unwrap()
+        .task_id
+        .unwrap();
+    sqlx::query("ALTER TABLE posts ADD CONSTRAINT reject_publish CHECK(false) NOT VALID")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stop = CancellationToken::new();
+    let workers = tokio::spawn(queue::run(app.clone(), stop.clone()));
+    let failed = await_upload(&routes, &auth, upload_id).await;
+    assert_eq!(failed["status"], "error", "{failed}");
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apalis.jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media_assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    // There is no publication checkpoint: remove a generated preview and require
+    // the fresh execution to refetch the source and regenerate it.
+    app.storage
+        .delete(&format!("media/{}/v1/180x180.jpg", metadata.sha256))
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE posts DROP CONSTRAINT reject_publish")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, _) = request(
+        &routes,
+        "POST",
+        &format!("/uploads/{upload_id}/retry"),
+        vec![],
+        "",
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let new_task = queries::get_processing_item(&pool, item_id)
+        .await
+        .unwrap()
+        .task_id
+        .unwrap();
+    assert_ne!(old_task, new_task);
+    let completed = await_upload(&routes, &auth, upload_id).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    app.storage
+        .download(
+            &format!("media/{}/v1/180x180.jpg", metadata.sha256),
+            &directory.path().join("preview"),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apalis.jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    worker::process(&app, item_id, &old_task).await.unwrap();
+    stop.cancel();
+    workers.await.unwrap().unwrap();
+    server.abort();
 }
 
 #[sqlx::test(migrator = "crate::db::MIGRATOR")]
@@ -549,10 +692,10 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
         8
     );
     // Simulate a process disappearing after claiming a durable input.
-    sqlx::raw_sql("INSERT INTO apalis.workers(id,worker_type,storage_name,last_seen) VALUES('dead-worker','uploads-v1','PgStorage',now()-interval '1 hour');
+    sqlx::raw_sql("INSERT INTO apalis.workers(id,worker_type,storage_name,last_seen) VALUES('dead-worker','uploads','PgStorage',now()-interval '1 hour');
         UPDATE apalis.jobs SET status='Running',lock_by='dead-worker',attempts=1 WHERE id=(SELECT min(id) FROM apalis.jobs)").execute(&pool).await.unwrap();
     let stop = CancellationToken::new();
-    let workers = tokio::spawn(worker::run(app.clone(), stop.clone()));
+    let workers = tokio::spawn(queue::run(app.clone(), stop.clone()));
     let completed = await_upload(&routes, &auth, upload_id).await;
     assert_eq!(completed["status"], "completed", "{completed}");
     let animated = completed["upload_media_assets"]
@@ -946,10 +1089,10 @@ async fn durable_uploads_search_edits_favorites_and_sessions(pool: PgPool) {
     );
     slow.store(false, std::sync::atomic::Ordering::SeqCst);
     sqlx::query("UPDATE apalis.workers SET last_seen=now()-interval '1 hour' WHERE id IN
-        (SELECT j.lock_by FROM apalis.jobs j JOIN upload_items i ON upload_task_run(j.job)=i.run_id WHERE i.upload_id=$1)")
+        (SELECT j.lock_by FROM apalis.jobs j JOIN upload_items i ON j.id=i.task_id WHERE i.upload_id=$1)")
         .bind(interrupted_id).execute(&pool).await.unwrap();
     let stop = CancellationToken::new();
-    let resumed = tokio::spawn(worker::run(app.clone(), stop.clone()));
+    let resumed = tokio::spawn(queue::run(app.clone(), stop.clone()));
     assert_eq!(
         await_upload(&routes, &auth, interrupted_id).await["status"],
         "completed"

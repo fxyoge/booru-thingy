@@ -82,13 +82,10 @@ CREATE TABLE upload_items (
     filename text NOT NULL DEFAULT '',
     source_url text NOT NULL DEFAULT '',
     staging_key text,
-    original_key text,
-    run_id text,
+    task_id text,
     media_asset_id bigint REFERENCES media_assets(id),
     post_id bigint REFERENCES posts(id),
-    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('receiving', 'pending', 'completed', 'error')),
     duplicate boolean NOT NULL DEFAULT false,
-    error text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );

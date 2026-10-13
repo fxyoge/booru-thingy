@@ -40,9 +40,9 @@ media_url_ttl_seconds = 3600
 upload_ticket_ttl_seconds = 900
 # Maximum total file bytes per batch / downloaded URL, 1 byte..5 GiB.
 max_upload_bytes = 536870912
-# Concurrent workflow steps per worker process, 1..32.
+# Concurrent uploads per worker process, 1..32.
 worker_concurrency = 2
-# Deadline per workflow step attempt, positive seconds.
+# Deadline per upload attempt, positive seconds.
 process_timeout_seconds = 300
 # Allow URL imports from private/reserved addresses.
 allow_private_source_urls = false

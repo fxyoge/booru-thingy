@@ -45,7 +45,8 @@ pub struct CreateDirectItemParams<'a> {
     pub filename: &'a str,
     pub expected_size: Option<i64>,
 }
-pub const CREATE_DIRECT_ITEM: &str = "INSERT INTO upload_items(upload_id,filename,expected_size,status)\nVALUES($1,$2,$3,'receiving') RETURNING id";
+pub const CREATE_DIRECT_ITEM: &str =
+    "INSERT INTO upload_items(upload_id,filename,expected_size)\nVALUES($1,$2,$3) RETURNING id";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CreateDirectItemRow {
     pub id: i64,
@@ -66,13 +67,12 @@ pub struct LockDirectItemParams {
     pub id: i64,
     pub upload_id: i64,
 }
-pub const LOCK_DIRECT_ITEM: &str = "SELECT id,status,expected_size,staging_key,accepted_at FROM upload_items\nWHERE id=$1 AND upload_id=$2 AND expected_size IS NOT NULL FOR UPDATE";
+pub const LOCK_DIRECT_ITEM: &str = "SELECT i.id,s.status,i.expected_size,i.accepted_at FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.id=$1 AND i.upload_id=$2 AND i.expected_size IS NOT NULL FOR UPDATE OF i";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LockDirectItemRow {
     pub id: i64,
     pub status: String,
     pub expected_size: Option<i64>,
-    pub staging_key: Option<String>,
     pub accepted_at: Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>,
 }
 pub async fn lock_direct_item<E: AsExecutor>(
@@ -142,7 +142,8 @@ pub struct AcceptDirectItemParams<'a> {
     pub staging_key: Option<&'a str>,
     pub id: i64,
 }
-pub const ACCEPT_DIRECT_ITEM: &str = "UPDATE upload_items SET status='pending',staging_key=$1,accepted_at=now(),updated_at=now() WHERE id=$2";
+pub const ACCEPT_DIRECT_ITEM: &str =
+    "UPDATE upload_items SET staging_key=$1,accepted_at=now(),updated_at=now() WHERE id=$2";
 pub async fn accept_direct_item<E: AsExecutor>(
     mut db: E,
     arg: AcceptDirectItemParams<'_>,
@@ -825,7 +826,7 @@ pub struct ListUploadsParams<'a> {
     pub result_offset: i64,
     pub result_limit: i64,
 }
-pub const LIST_UPLOADS: &str = "SELECT to_jsonb(u) AS payload FROM uploads u\nWHERE ($1::boolean IS NULL OR\n       EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.post_id IS NOT NULL)=$1::boolean)\nAND CASE\n    WHEN $2::text IS NULL THEN true\n    WHEN $2::text IN ('pending','processing') THEN\n        EXISTS(SELECT 1 FROM upload_items i JOIN upload_item_states s ON s.id=i.id\n               WHERE i.upload_id=u.id AND s.status IN ('receiving','pending','processing'))\n    WHEN $2::text='completed' THEN\n        EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id)\n        AND NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.status<>'completed')\n    WHEN $2::text='error' THEN\n        (NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id)\n         OR EXISTS(SELECT 1 FROM upload_items i JOIN upload_item_states s ON s.id=i.id WHERE i.upload_id=u.id AND s.status='error'))\n        AND NOT EXISTS(SELECT 1 FROM upload_items i JOIN upload_item_states s ON s.id=i.id\n                       WHERE i.upload_id=u.id AND s.status IN ('receiving','pending','processing'))\n    ELSE false END\nORDER BY CASE WHEN $3::boolean THEN u.id END ASC,\n         CASE WHEN NOT $3::boolean THEN u.id END DESC\nLIMIT $5::bigint OFFSET $4::bigint";
+pub const LIST_UPLOADS: &str = "SELECT to_jsonb(u) AS payload FROM uploads u\nWHERE ($1::boolean IS NULL OR\n       EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.post_id IS NOT NULL)=$1::boolean)\nAND CASE\n    WHEN $2::text IS NULL THEN true\n    WHEN $2::text IN ('pending','processing') THEN\n        EXISTS(SELECT 1 FROM upload_items i JOIN upload_item_states s ON s.id=i.id\n               WHERE i.upload_id=u.id AND s.status IN ('receiving','pending','processing'))\n    WHEN $2::text='completed' THEN\n        EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id)\n        AND NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id AND i.post_id IS NULL)\n    WHEN $2::text='error' THEN\n        (NOT EXISTS(SELECT 1 FROM upload_items i WHERE i.upload_id=u.id)\n         OR EXISTS(SELECT 1 FROM upload_items i JOIN upload_item_states s ON s.id=i.id WHERE i.upload_id=u.id AND s.status='error'))\n        AND NOT EXISTS(SELECT 1 FROM upload_items i JOIN upload_item_states s ON s.id=i.id\n                       WHERE i.upload_id=u.id AND s.status IN ('receiving','pending','processing'))\n    ELSE false END\nORDER BY CASE WHEN $3::boolean THEN u.id END ASC,\n         CASE WHEN NOT $3::boolean THEN u.id END DESC\nLIMIT $5::bigint OFFSET $4::bigint";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ListUploadsRow {
     pub payload: serde_json::Value,
@@ -843,7 +844,7 @@ pub async fn list_uploads<E: AsExecutor>(
         .fetch_all(db.as_executor())
         .await
 }
-pub const LOCK_RETRY_UPLOAD_ITEMS: &str = "SELECT i.id FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.upload_id=$1 AND s.status='error'\nAND (i.original_key IS NOT NULL OR i.staging_key IS NOT NULL OR i.source_url <> '')\nAND (i.expected_size IS NULL OR i.accepted_at IS NOT NULL) FOR UPDATE OF i";
+pub const LOCK_RETRY_UPLOAD_ITEMS: &str = "SELECT i.id FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.upload_id=$1 AND s.status='error'\nAND (i.staging_key IS NOT NULL OR i.source_url <> '')\nAND (i.expected_size IS NULL OR i.accepted_at IS NOT NULL) FOR UPDATE OF i";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LockRetryUploadItemsRow {
     pub id: i64,
@@ -859,17 +860,17 @@ pub async fn lock_retry_upload_items<E: AsExecutor>(
 }
 #[derive(Debug, Clone)]
 pub struct StartUploadExecutionParams<'a> {
-    pub run_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
     pub id: i64,
 }
 pub const START_UPLOAD_EXECUTION: &str =
-    "UPDATE upload_items SET run_id=$1,status='pending',error=NULL,updated_at=now()\nWHERE id=$2";
+    "UPDATE upload_items SET task_id=$1,updated_at=now()\nWHERE id=$2";
 pub async fn start_upload_execution<E: AsExecutor>(
     mut db: E,
     arg: StartUploadExecutionParams<'_>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(START_UPLOAD_EXECUTION)
-        .bind(arg.run_id)
+        .bind(arg.task_id)
         .bind(arg.id)
         .execute(db.as_executor())
         .await?;
@@ -890,29 +891,14 @@ pub async fn get_upload_item_state<E: AsExecutor>(
         .fetch_one(db.as_executor())
         .await
 }
-pub const GET_FAILED_UPLOAD_TASK: &str = "SELECT j.job,COALESCE(j.metadata->'apalis_workflow.context.step_index','0')::integer AS step_index\nFROM apalis.jobs j JOIN upload_items i ON upload_task_run(j.job)=i.run_id\nWHERE i.id=$1 AND j.job_type='uploads-v1'\nAND (j.status='Killed' OR (j.status='Failed' AND j.attempts>=j.max_attempts))\nORDER BY COALESCE(j.metadata->'apalis_workflow.context.step_index','0')::integer DESC LIMIT 1";
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct GetFailedUploadTaskRow {
-    pub job: Vec<u8>,
-    pub step_index: i32,
-}
-pub async fn get_failed_upload_task<E: AsExecutor>(
-    mut db: E,
-    id: i64,
-) -> Result<GetFailedUploadTaskRow, sqlx::Error> {
-    sqlx::query_as::<_, GetFailedUploadTaskRow>(GET_FAILED_UPLOAD_TASK)
-        .bind(id)
-        .fetch_one(db.as_executor())
-        .await
-}
 pub const GET_PROCESSING_ITEM: &str =
-    "SELECT source_url,original_key,staging_key,run_id FROM upload_items WHERE id=$1";
+    "SELECT source_url,staging_key,task_id,post_id FROM upload_items WHERE id=$1";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GetProcessingItemRow {
     pub source_url: String,
-    pub original_key: Option<String>,
     pub staging_key: Option<String>,
-    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub post_id: Option<i64>,
 }
 pub async fn get_processing_item<E: AsExecutor>(
     mut db: E,
@@ -923,12 +909,12 @@ pub async fn get_processing_item<E: AsExecutor>(
         .fetch_one(db.as_executor())
         .await
 }
-pub const LOCK_PROCESSING_ITEM: &str = "SELECT i.upload_id,i.post_id,i.run_id,u.source,u.tag_string,u.rating FROM upload_items i JOIN uploads u ON u.id=i.upload_id\nWHERE i.id=$1 FOR UPDATE OF i";
+pub const LOCK_PROCESSING_ITEM: &str = "SELECT i.upload_id,i.post_id,i.task_id,u.source,u.tag_string,u.rating FROM upload_items i JOIN uploads u ON u.id=i.upload_id\nWHERE i.id=$1 FOR UPDATE OF i";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LockProcessingItemRow {
     pub upload_id: i64,
     pub post_id: Option<i64>,
-    pub run_id: Option<String>,
+    pub task_id: Option<String>,
     pub source: String,
     pub tag_string: String,
     pub rating: String,
@@ -943,35 +929,13 @@ pub async fn lock_processing_item<E: AsExecutor>(
         .await
 }
 #[derive(Debug, Clone)]
-pub struct RememberOriginalParams<'a> {
-    pub original_key: Option<&'a str>,
-    pub id: i64,
-    pub run_id: Option<&'a str>,
-}
-pub const REMEMBER_ORIGINAL: &str = "UPDATE upload_items SET original_key=COALESCE(original_key,$1),updated_at=now()\nWHERE id=$2 AND run_id=$3 RETURNING original_key";
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct RememberOriginalRow {
-    pub original_key: Option<String>,
-}
-pub async fn remember_original<E: AsExecutor>(
-    mut db: E,
-    arg: RememberOriginalParams<'_>,
-) -> Result<RememberOriginalRow, sqlx::Error> {
-    sqlx::query_as::<_, RememberOriginalRow>(REMEMBER_ORIGINAL)
-        .bind(arg.original_key)
-        .bind(arg.id)
-        .bind(arg.run_id)
-        .fetch_one(db.as_executor())
-        .await
-}
-#[derive(Debug, Clone)]
 pub struct CompleteUploadItemParams {
     pub media_asset_id: Option<i64>,
     pub post_id: Option<i64>,
     pub duplicate: bool,
     pub id: i64,
 }
-pub const COMPLETE_UPLOAD_ITEM: &str = "UPDATE upload_items SET status='completed',media_asset_id=$1,post_id=$2,\nduplicate=$3,error=NULL,updated_at=now() WHERE id=$4";
+pub const COMPLETE_UPLOAD_ITEM: &str = "UPDATE upload_items SET media_asset_id=$1,post_id=$2,\nduplicate=$3,updated_at=now() WHERE id=$4";
 pub async fn complete_upload_item<E: AsExecutor>(
     mut db: E,
     arg: CompleteUploadItemParams,
@@ -993,18 +957,11 @@ pub async fn touch_upload<E: AsExecutor>(mut db: E, id: i64) -> Result<(), sqlx:
         .await?;
     Ok(())
 }
-pub const EXPIRE_INTERRUPTED_ITEMS: &str = "UPDATE upload_items SET status='error',error='Upload interrupted',updated_at=now()\nWHERE status='receiving' AND updated_at<now()-interval '24 hours'";
-pub async fn expire_interrupted_items<E: AsExecutor>(mut db: E) -> Result<(), sqlx::Error> {
-    sqlx::query(EXPIRE_INTERRUPTED_ITEMS)
-        .execute(db.as_executor())
-        .await?;
-    Ok(())
-}
-pub const LIST_STAGING_CLEANUP_CANDIDATES: &str = "SELECT i.id,i.staging_key FROM upload_items i JOIN upload_item_states s ON s.id=i.id\nWHERE i.staging_key IS NOT NULL\nAND (s.status='completed' OR (s.status='error' AND i.updated_at<now()-interval '7 days')) LIMIT 100";
+pub const LIST_STAGING_CLEANUP_CANDIDATES: &str =
+    "SELECT id FROM upload_items WHERE staging_key IS NOT NULL AND post_id IS NOT NULL LIMIT 100";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ListStagingCleanupCandidatesRow {
     pub id: i64,
-    pub staging_key: Option<String>,
 }
 pub async fn list_staging_cleanup_candidates<E: AsExecutor>(
     mut db: E,
@@ -1013,7 +970,8 @@ pub async fn list_staging_cleanup_candidates<E: AsExecutor>(
         .fetch_all(db.as_executor())
         .await
 }
-pub const LOCK_STAGING_CLEANUP_ITEM: &str = "SELECT i.staging_key FROM upload_items i JOIN upload_item_states s ON s.id=i.id WHERE i.id=$1\nAND (s.status='completed' OR (s.status='error' AND i.updated_at<now()-interval '7 days')) FOR UPDATE OF i";
+pub const LOCK_STAGING_CLEANUP_ITEM: &str =
+    "SELECT staging_key FROM upload_items WHERE id=$1 AND post_id IS NOT NULL FOR UPDATE";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LockStagingCleanupItemRow {
     pub staging_key: Option<String>,
@@ -1036,7 +994,7 @@ pub async fn clear_staging_key<E: AsExecutor>(mut db: E, id: i64) -> Result<(), 
     Ok(())
 }
 pub const GET_COMPLETED_ITEM_ASSET: &str =
-    "SELECT media_asset_id FROM upload_items WHERE id=$1 AND status='completed'";
+    "SELECT media_asset_id FROM upload_items WHERE id=$1 AND post_id IS NOT NULL";
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GetCompletedItemAssetRow {
     pub media_asset_id: Option<i64>,

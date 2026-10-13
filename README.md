@@ -108,9 +108,9 @@ Options:
       --max-upload-bytes <MAX_UPLOAD_BYTES>
           Maximum total file bytes per upload batch or downloaded URL
       --worker-concurrency <WORKER_CONCURRENCY>
-          Concurrent workflow steps per worker process
+          Concurrent uploads per worker process
       --process-timeout-seconds <PROCESS_TIMEOUT_SECONDS>
-          Deadline per workflow step attempt, in seconds
+          Deadline per upload attempt, in seconds
       --allow-private-source-urls <ALLOW_PRIVATE_SOURCE_URLS>
           [possible values: true, false]
       --rust-log <RUST_LOG>

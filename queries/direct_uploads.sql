@@ -1,10 +1,10 @@
 -- name: CreateDirectItem :one
-INSERT INTO upload_items(upload_id,filename,expected_size,status)
-VALUES(sqlc.arg(upload_id),sqlc.arg(filename),sqlc.arg(expected_size),'receiving') RETURNING id;
+INSERT INTO upload_items(upload_id,filename,expected_size)
+VALUES(sqlc.arg(upload_id),sqlc.arg(filename),sqlc.arg(expected_size)) RETURNING id;
 
 -- name: LockDirectItem :one
-SELECT id,status,expected_size,staging_key,accepted_at FROM upload_items
-WHERE id=sqlc.arg(id) AND upload_id=sqlc.arg(upload_id) AND expected_size IS NOT NULL FOR UPDATE;
+SELECT i.id,s.status,i.expected_size,i.accepted_at FROM upload_items i JOIN upload_item_states s ON s.id=i.id
+WHERE i.id=sqlc.arg(id) AND i.upload_id=sqlc.arg(upload_id) AND i.expected_size IS NOT NULL FOR UPDATE OF i;
 
 -- name: CreateUploadGrant :one
 INSERT INTO upload_grants(upload_item_id,object_key,expires_at)
@@ -17,7 +17,7 @@ SELECT count(*)::bigint AS count FROM upload_grants WHERE upload_item_id=sqlc.ar
 SELECT object_key,expires_at FROM upload_grants WHERE upload_item_id=sqlc.arg(upload_item_id) ORDER BY id DESC LIMIT 1;
 
 -- name: AcceptDirectItem :exec
-UPDATE upload_items SET status='pending',staging_key=sqlc.arg(staging_key),accepted_at=now(),updated_at=now() WHERE id=sqlc.arg(id);
+UPDATE upload_items SET staging_key=sqlc.arg(staging_key),accepted_at=now(),updated_at=now() WHERE id=sqlc.arg(id);
 
 -- name: ExpiredUploadGrants :many
 SELECT id,object_key FROM upload_grants WHERE expires_at<now()-interval '1 hour' ORDER BY id LIMIT 100;
