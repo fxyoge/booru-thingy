@@ -7,7 +7,7 @@ export function UploadItem({item: initial, onRefreshPreview}) {
     const name = van.state(''), message = van.state(''), status = van.state('');
     const failed = van.state(false), src = van.state(null), visible = van.state(false);
     let assetKey, latestUrl = '', renewed = false;
-    const media = img({class: 'queue-thumb', alt: '', loading: 'lazy', decoding: 'async', hidden: () => !visible.val,
+    const media = img({'data-testid': 'upload-thumbnail', class: 'queue-thumb', alt: '', loading: 'lazy', decoding: 'async', hidden: () => !visible.val,
         onerror: () => {
             // Renew only a failed/expired lazy thumbnail, never an already-loaded image.
             if (latestUrl && src.val !== latestUrl) src.val = latestUrl;
@@ -19,11 +19,12 @@ export function UploadItem({item: initial, onRefreshPreview}) {
         else dom.removeAttribute('src');
         return dom;
     });
-    const element = div({class: 'queue-item'}, media,
+    const element = div({'data-testid': 'upload-item', 'data-item-id': initial.id, class: 'queue-item'}, media,
         div({class: 'queue-text'}, strong(name), small(message)),
         span({class: () => `state${failed.val ? ' failed' : ''}`}, status));
 
     function update(item) {
+        element.setAttribute('data-status', item.status);
         name.val = item.filename || item.source_url || 'URL import';
         const text = item.error || (item.post_id
             ? `${item.duplicate ? 'Already in your collection' : 'Uploaded'} · Post #${item.post_id}`

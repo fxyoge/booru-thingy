@@ -14,7 +14,7 @@ export function UploadPage({maxBytes, sharedUrl}) {
     return {
         element: van.tags.div(SessionHeader(session), van.tags.main(
             LoginPanel(session),
-            van.tags.div({id: 'workspace', hidden: () => !session.authenticated.val}, composer.element, recent.element))),
+            van.tags.div({id: 'workspace', 'data-testid': 'workspace', hidden: () => !session.authenticated.val}, composer.element, recent.element))),
         restoreSession: session.restore
     };
 }

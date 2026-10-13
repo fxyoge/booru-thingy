@@ -6,8 +6,8 @@ const {label, span, input, div, button, small, code} = van.tags;
 export function TagInput({value, busy}) {
     const open = van.state(false);
     let request, timer;
-    const suggestions = div({id: 'suggestions', class: 'suggestions', hidden: () => !open.val});
-    const field = input({id: 'tags', autocomplete: 'off', placeholder: 'cat very_good_cat', value, disabled: busy,
+    const suggestions = div({id: 'suggestions', 'data-testid': 'tag-suggestions', class: 'suggestions', hidden: () => !open.val});
+    const field = input({id: 'tags', 'data-testid': 'tags', autocomplete: 'off', placeholder: 'cat very_good_cat', value, disabled: busy,
         'aria-controls': 'suggestions', 'aria-expanded': () => String(open.val),
         oninput: (event) => {value.val = event.target.value; search();},
         onkeydown: (event) => {
@@ -33,7 +33,7 @@ export function TagInput({value, busy}) {
             try {
                 const tags = await api(`/autocomplete.json?search[query]=${encodeURIComponent(prefix)}&limit=6`, {signal: current.signal});
                 if (request !== current) return;
-                suggestions.replaceChildren(...tags.map((tag) => button({type: 'button', onclick: () => {
+                suggestions.replaceChildren(...tags.map((tag) => button({'data-testid': 'tag-suggestion', 'data-tag': tag.value, type: 'button', onclick: () => {
                     value.val = value.val.replace(/\S*$/, tag.value + ' ');
                     close();
                     field.focus();

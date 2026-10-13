@@ -124,8 +124,8 @@ def site(page):
 
         def open(self):
             page.goto("http://upload.test/uploads/new")
-            expect(page.locator("#workspace")).to_be_visible()
-            expect(page.locator(".queue-card")).to_have_count(min(10, len(self.uploads)))
+            expect(page.get_by_test_id("workspace")).to_be_visible()
+            expect(page.get_by_test_id("upload-card")).to_have_count(min(10, len(self.uploads)))
 
         def count(self, path):
             return sum(p == path for _, p in self.requests)
@@ -139,8 +139,8 @@ def site(page):
 
 def test_idle_queue_does_not_poll_or_reload_images(page, site):
     site.open()
-    expect(page.locator(".queue-thumb")).to_be_visible()
-    page.wait_for_function("document.querySelector('.queue-thumb').naturalWidth > 0")
+    expect(page.get_by_test_id("upload-thumbnail")).to_be_visible()
+    page.wait_for_function("document.querySelector('[data-testid=upload-thumbnail]').naturalWidth > 0")
     page.wait_for_timeout(4500)
     assert site.count("/users/1/uploads.json") == 1
     assert site.count("/uploads/1") == 0
@@ -150,11 +150,11 @@ def test_idle_queue_does_not_poll_or_reload_images(page, site):
 def test_active_updates_preserve_thumbnail_and_stop_when_completed(page, site):
     site.uploads = [upload(processing=True)]
     site.open()
-    page.locator(".queue-thumb").first.evaluate("el => window.originalThumb = el")
-    expect(page.locator("#queue-status")).to_have_text("Processing in the background")
-    expect(page.locator("#queue-status")).to_be_empty(timeout=10000)
-    expect(page.locator(".queue-item").last).to_contain_text("Uploaded")
-    assert page.evaluate("originalThumb === document.querySelector('.queue-thumb')")
+    page.get_by_test_id("upload-thumbnail").first.evaluate("el => window.originalThumb = el")
+    expect(page.get_by_test_id("queue-status")).to_have_text("Processing in the background")
+    expect(page.get_by_test_id("queue-status")).to_be_empty(timeout=10000)
+    expect(page.get_by_test_id("upload-item").last).to_have_attribute("data-status", "completed")
+    assert page.evaluate("originalThumb === document.querySelector('[data-testid=upload-thumbnail]')")
     assert site.count("/users/1/uploads.json") == 1
     assert site.count("/thumb/1") == 1
     assert site.polls == 2
@@ -165,31 +165,31 @@ def test_active_updates_preserve_thumbnail_and_stop_when_completed(page, site):
 def test_pagination_and_empty_reconciliation_preserve_existing_nodes(page, site):
     site.uploads = [upload(i) for i in range(11, 0, -1)]
     site.open()
-    page.locator(".queue-thumb").first.evaluate("el => window.originalThumb = el")
-    page.get_by_role("button", name="Show older uploads").click()
-    expect(page.locator(".queue-card")).to_have_count(11)
-    assert page.evaluate("originalThumb === document.querySelector('.queue-thumb')")
+    page.get_by_test_id("upload-thumbnail").first.evaluate("el => window.originalThumb = el")
+    page.get_by_test_id("more-uploads").click()
+    expect(page.get_by_test_id("upload-card")).to_have_count(11)
+    assert page.evaluate("originalThumb === document.querySelector('[data-testid=upload-thumbnail]')")
     assert site.count("/thumb/11") == 1
     site.uploads = []
     page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
-    expect(page.locator(".queue-card")).to_have_count(0)
-    expect(page.locator(".empty-state")).to_be_visible()
+    expect(page.get_by_test_id("upload-card")).to_have_count(0)
+    expect(page.get_by_test_id("uploads-empty")).to_be_visible()
 
 
 def test_selected_previews_survive_add_remove_and_upload(page, site):
     site.open()
-    page.locator("#files").set_input_files({"name": "first.png", "mimeType": "image/png", "buffer": PNG})
-    page.locator("#previews img").evaluate("el => window.firstPreview = el")
-    page.locator("#files").set_input_files({"name": "second.png", "mimeType": "image/png", "buffer": PNG})
-    expect(page.locator("#previews .preview")).to_have_count(2)
-    assert page.evaluate("firstPreview === document.querySelector('#previews img')")
-    page.locator("#previews img").last.evaluate("el => window.secondPreview = el")
-    page.get_by_role("button", name="Remove first.png", exact=True).click()
-    assert page.evaluate("secondPreview === document.querySelector('#previews img')")
-    page.get_by_role("button", name="Upload", exact=True).click()
-    expect(page.locator("#previews .preview")).to_have_count(0)
-    expect(page.locator("#upload-error")).to_be_empty()
-    expect(page.locator(".queue-card").first).to_contain_text("Uploaded")
+    page.get_by_test_id("files").set_input_files({"name": "first.png", "mimeType": "image/png", "buffer": PNG})
+    page.get_by_test_id("file-preview-media").evaluate("el => window.firstPreview = el")
+    page.get_by_test_id("files").set_input_files({"name": "second.png", "mimeType": "image/png", "buffer": PNG})
+    expect(page.get_by_test_id("file-preview")).to_have_count(2)
+    assert page.evaluate("firstPreview === document.querySelector('[data-testid=file-preview-media]')")
+    page.get_by_test_id("file-preview-media").last.evaluate("el => window.secondPreview = el")
+    page.get_by_test_id("file-preview").and_(page.locator('[data-filename="first.png"]')).get_by_test_id("remove-file").click()
+    assert page.evaluate("secondPreview === document.querySelector('[data-testid=file-preview-media]')")
+    page.get_by_test_id("upload-submit").click()
+    expect(page.get_by_test_id("file-preview")).to_have_count(0)
+    expect(page.get_by_test_id("upload-error")).to_be_empty()
+    expect(page.get_by_test_id("upload-card").first.get_by_test_id("upload-item")).to_have_attribute("data-status", "completed")
     assert site.count("/users/1/uploads.json") == 1
     assert site.count("/uploads/direct") == 1
     assert site.count("/uploads/2/items/20/complete") == 1
@@ -203,13 +203,13 @@ def test_visibility_pause_resume_and_logout(page, site):
     page.wait_for_timeout(2500)
     assert site.polls == 0
     page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
-    page.wait_for_function("document.querySelector('#queue-status').textContent !== ''")
-    page.get_by_role("button", name="Sign out").click()
-    expect(page.locator("#login-panel")).to_be_visible()
+    page.wait_for_function("document.querySelector('[data-testid=queue-status]').textContent !== ''")
+    page.get_by_test_id("logout").click()
+    expect(page.get_by_test_id("login-panel")).to_be_visible()
     requests = len(site.requests)
     page.wait_for_timeout(2500)
     assert len(site.requests) == requests
-    expect(page.locator(".queue-card")).to_have_count(0)
+    expect(page.get_by_test_id("upload-card")).to_have_count(0)
 
 
 def test_failed_url_retry_uses_response_and_only_polls_active_upload(page, site):
@@ -219,10 +219,10 @@ def test_failed_url_retry_uses_response_and_only_polls_active_upload(page, site)
     site.uploads = [failed]
     site.complete_after = 1
     site.open()
-    page.get_by_role("button", name="Retry failed items").click()
-    expect(page.locator("#queue-status")).to_have_text("Processing in the background")
-    expect(page.locator("#queue-status")).to_be_empty(timeout=10000)
-    expect(page.locator(".queue-item")).to_contain_text("Uploaded")
+    page.get_by_test_id("retry-upload").click()
+    expect(page.get_by_test_id("queue-status")).to_have_text("Processing in the background")
+    expect(page.get_by_test_id("queue-status")).to_be_empty(timeout=10000)
+    expect(page.get_by_test_id("upload-item")).to_have_attribute("data-status", "completed")
     assert site.count("/uploads/1/retry") == 1
     assert site.count("/users/1/uploads.json") == 1
     assert site.polls == 1
@@ -231,26 +231,26 @@ def test_failed_url_retry_uses_response_and_only_polls_active_upload(page, site)
 def test_shared_url_survives_session_restore_and_login_with_reactive_metadata(page, site):
     site.authenticated = False
     page.goto("http://upload.test/uploads/new?url=https%3A%2F%2Fsource.test%2Fimage.png")
-    expect(page.locator("#login-panel")).to_be_visible()
-    expect(page.locator("#source-url")).to_have_value("https://source.test/image.png")
-    page.locator("[name=login]").fill("owner")
-    page.locator("[name=api_key]").fill("key")
-    page.get_by_role("button", name="Sign in", exact=False).click()
-    expect(page.locator("#workspace")).to_be_visible()
-    expect(page.locator("#url-panel")).to_be_visible()
-    expect(page.locator("#source-label")).to_be_hidden()
-    page.locator("#tags").fill("test")
-    expect(page.locator("#suggestions")).to_be_visible()
-    page.locator("#suggestions button").click()
-    expect(page.locator("#tags")).to_have_value("test_tag ")
-    page.get_by_text("Questionable", exact=True).click()
-    expect(page.locator('[name=rating][value=q]')).to_be_checked()
+    expect(page.get_by_test_id("login-panel")).to_be_visible()
+    expect(page.get_by_test_id("source-url")).to_have_value("https://source.test/image.png")
+    page.get_by_test_id("login").fill("owner")
+    page.get_by_test_id("api-key").fill("key")
+    page.get_by_test_id("sign-in").click()
+    expect(page.get_by_test_id("workspace")).to_be_visible()
+    expect(page.get_by_test_id("url-panel")).to_be_visible()
+    expect(page.get_by_test_id("source-label")).to_be_hidden()
+    page.get_by_test_id("tags").fill("test")
+    expect(page.get_by_test_id("tag-suggestions")).to_be_visible()
+    page.get_by_test_id("tag-suggestion").click()
+    expect(page.get_by_test_id("tags")).to_have_value("test_tag ")
+    page.get_by_test_id("rating-q").check()
+    expect(page.get_by_test_id("rating-q")).to_be_checked()
     with page.expect_request(lambda request: request.method == "POST" and request.url.endswith("/uploads.json")) as received:
-        page.get_by_role("button", name="Upload", exact=True).click()
+        page.get_by_test_id("upload-submit").click()
     assert received.value.post_data_json == {"upload": {"source": "https://source.test/image.png", "tag_string": "test_tag ", "rating": "q"}}
-    expect(page.locator("#transfer-label")).to_have_text("Done.")
-    expect(page.locator("#tags")).to_have_value("")
-    expect(page.locator("#source-url")).to_have_value("")
+    expect(page.get_by_test_id("transfer-label")).to_have_text("Done.")
+    expect(page.get_by_test_id("tags")).to_have_value("")
+    expect(page.get_by_test_id("source-url")).to_have_value("")
     assert "?" not in page.url
     page.set_viewport_size({"width": 390, "height": 844})
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -259,19 +259,19 @@ def test_shared_url_survives_session_restore_and_login_with_reactive_metadata(pa
 def test_partial_transfer_retry_keeps_previews_and_reuses_batch(page, site):
     site.fail_storage_once = True
     site.open()
-    page.locator("#files").set_input_files([
+    page.get_by_test_id("files").set_input_files([
         {"name": "first.png", "mimeType": "image/png", "buffer": PNG},
         {"name": "second.png", "mimeType": "image/png", "buffer": PNG},
     ])
-    page.locator("#previews img").first.evaluate("el => window.firstPreview = el")
-    page.get_by_role("button", name="Upload", exact=True).click()
-    expect(page.locator("#upload-error")).to_contain_text("retry unfinished files")
-    expect(page.locator("#upload-button")).to_be_enabled()
-    assert page.evaluate("firstPreview === document.querySelector('#previews img')")
-    expect(page.locator("#previews .preview")).to_have_count(2)
-    page.get_by_role("button", name="Upload", exact=True).click()
-    expect(page.locator("#previews .preview")).to_have_count(0)
-    expect(page.locator("#upload-error")).to_be_empty()
+    page.get_by_test_id("file-preview-media").first.evaluate("el => window.firstPreview = el")
+    page.get_by_test_id("upload-submit").click()
+    expect(page.get_by_test_id("upload-error")).to_contain_text("retry unfinished files")
+    expect(page.get_by_test_id("upload-submit")).to_be_enabled()
+    assert page.evaluate("firstPreview === document.querySelector('[data-testid=file-preview-media]')")
+    expect(page.get_by_test_id("file-preview")).to_have_count(2)
+    page.get_by_test_id("upload-submit").click()
+    expect(page.get_by_test_id("file-preview")).to_have_count(0)
+    expect(page.get_by_test_id("upload-error")).to_be_empty()
     assert site.count("/uploads/direct") == 1
     assert site.count("/storage") == 3
     assert site.count("/uploads/2/items/20/complete") == 1
@@ -284,12 +284,12 @@ def test_polling_failure_backs_off_and_recovers(page, site):
     site.complete_after = 1
     site.fail_polls = True
     site.open()
-    expect(page.locator("#queue-status")).to_have_text("Temporarily unavailable", timeout=5000)
+    expect(page.get_by_test_id("queue-status")).to_have_text("Temporarily unavailable", timeout=5000)
     assert site.polls == 1
     page.wait_for_timeout(2500)
     assert site.polls == 1  # First failure increases the next interval to four seconds.
     site.fail_polls = False
-    expect(page.locator("#queue-status")).to_be_empty(timeout=6000)
+    expect(page.get_by_test_id("queue-status")).to_be_empty(timeout=6000)
     assert site.polls == 2
     assert site.count("/users/1/uploads.json") == 1
 
@@ -304,8 +304,8 @@ def test_cancelled_poll_cannot_overwrite_newer_reconciliation(page, site):
     old = copy.deepcopy(site.uploads[0])
     site.uploads = [upload()]
     page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
-    expect(page.locator("#queue-status")).to_be_empty()
+    expect(page.get_by_test_id("queue-status")).to_be_empty()
     held[0].fulfill(json=old)
     page.wait_for_timeout(100)
-    expect(page.locator("#queue-status")).to_be_empty()
-    expect(page.locator(".queue-item")).to_have_count(1)
+    expect(page.get_by_test_id("queue-status")).to_be_empty()
+    expect(page.get_by_test_id("upload-item")).to_have_count(1)

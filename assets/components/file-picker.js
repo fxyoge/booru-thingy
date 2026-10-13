@@ -9,7 +9,7 @@ export function FilePicker({busy, maxBytes, onError, onSelect}) {
     let selected = [];
     const dragging = van.state(false);
     const previews = div({id: 'previews', class: 'previews', 'aria-label': 'Selected files'});
-    const chooser = input({id: 'files', type: 'file', multiple: true, disabled: busy,
+    const chooser = input({id: 'files', 'data-testid': 'files', type: 'file', multiple: true, disabled: busy,
         accept: 'image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm',
         onchange: (event) => {add(event.target.files); event.target.value = '';}});
     const drag = (event) => {event.preventDefault(); dragging.val = true;};

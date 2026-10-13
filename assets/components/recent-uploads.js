@@ -26,12 +26,12 @@ export function RecentUploads() {
             }
         }
     });
-    van.add(container, div({class: 'empty-state', hidden: () => !queue.empty.val},
+    van.add(container, div({'data-testid': 'uploads-empty', class: 'empty-state', hidden: () => !queue.empty.val},
         span({'aria-hidden': 'true'}, '✧'), p('No recent uploads.')));
     const element = section({class: 'recent'},
         div({class: 'section-heading'}, h2('Recent uploads'),
-            span({id: 'queue-status', class: 'muted', role: 'status'}, queue.status)), container,
-        button({id: 'more', class: 'quiet', hidden: () => !queue.more.val, onclick: queue.loadMore}, 'Show older uploads'));
+            span({id: 'queue-status', 'data-testid': 'queue-status', class: 'muted', role: 'status'}, queue.status)), container,
+        button({id: 'more', 'data-testid': 'more-uploads', class: 'quiet', hidden: () => !queue.more.val, onclick: queue.loadMore}, 'Show older uploads'));
     document.addEventListener('visibilitychange', queue.visibilityChanged);
     return {element, accept: queue.accept, start: queue.start, stop: queue.stop};
 }

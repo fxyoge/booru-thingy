@@ -48,14 +48,14 @@ export function UploadComposer({session, onUpload, maxBytes, sharedUrl = ''}) {
         div({class: 'section-heading'}, h2('Upload')), UploadTabs({mode, busy}),
         form({id: 'upload-form', onsubmit: submit},
             div({id: 'file-panel', role: 'tabpanel', 'aria-labelledby': 'file-tab', hidden: () => mode.val !== 'files'}, picker.element),
-            div({id: 'url-panel', role: 'tabpanel', 'aria-labelledby': 'url-tab', hidden: () => mode.val !== 'url'},
-                label('Direct media URL', input({id: 'source-url', type: 'url', value: sourceUrl, disabled: busy,
+            div({id: 'url-panel', 'data-testid': 'url-panel', role: 'tabpanel', 'aria-labelledby': 'url-tab', hidden: () => mode.val !== 'url'},
+                label('Direct media URL', input({id: 'source-url', 'data-testid': 'source-url', type: 'url', value: sourceUrl, disabled: busy,
                     placeholder: 'https://example.com/something-good.webp', oninput: (event) => {sourceUrl.val = event.target.value;}})),
                 p({class: 'field-help'}, 'A link to the image or video itself, rather than a web page.')),
             metadata.element,
-            div({class: 'submit-row'}, button({id: 'upload-button', class: 'primary', type: 'submit', disabled: busy},
+            div({class: 'submit-row'}, button({id: 'upload-button', 'data-testid': 'upload-submit', class: 'primary', type: 'submit', disabled: busy},
                 'Upload', span({'aria-hidden': 'true'}, '↗'))),
-            transferStatus.element, p({id: 'upload-error', class: 'error', role: 'alert'}, error)));
+            transferStatus.element, p({id: 'upload-error', 'data-testid': 'upload-error', class: 'error', role: 'alert'}, error)));
 
     document.addEventListener('paste', (event) => {
         if (session.authenticated.val && event.clipboardData.files.length) {

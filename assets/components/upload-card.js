@@ -6,10 +6,10 @@ const {div, span, p, button} = van.tags;
 export function UploadCard({upload: initial, onRetry, onRefreshPreview}) {
     const items = new Map(), empty = van.state(false), retryable = van.state(false), retrying = van.state(false);
     const rows = div();
-    const element = div({class: 'queue-card'},
+    const element = div({'data-testid': 'upload-card', 'data-upload-id': initial.id, class: 'queue-card'},
         div({class: 'queue-title'}, span(`Upload #${initial.id}`), span(new Date(initial.created_at).toLocaleString())), rows,
         p({class: 'field-help', hidden: () => !empty.val}, 'Upload was interrupted before any files were received.'),
-        button({type: 'button', class: 'quiet', hidden: () => !retryable.val, disabled: retrying, onclick: async () => {
+        button({'data-testid': 'retry-upload', type: 'button', class: 'quiet', hidden: () => !retryable.val, disabled: retrying, onclick: async () => {
             if (retrying.val) return;
             retrying.val = true;
             try {await onRetry(initial.id);}
