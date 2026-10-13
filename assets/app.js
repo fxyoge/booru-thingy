@@ -282,7 +282,7 @@ async function transferFiles(metadata) {
     const update = () => {
         const percent = Math.round(batch.items.reduce((sum, item) => sum + item.loaded, 0) / total * 100);
         $('progress').value = percent;
-        $('transfer-label').textContent = `Transferring ${percent}% · ${batch.items.filter((item) => item.completed).length}/${batch.items.length} accepted`;
+        $('transfer-label').textContent = `Uploading ${percent}% · ${batch.items.filter((item) => item.completed).length}/${batch.items.length} uploaded`;
     };
     const run = async () => {
         while (cursor < batch.items.length) {
@@ -345,7 +345,7 @@ $('upload-form').addEventListener('submit', async (event) => {
     $('transfer').hidden = false;
     $('progress').value = 0;
     previews();
-    $('transfer-label').textContent = 'Uploading…';
+    $('transfer-label').textContent = 'Uploading...';
     try {
         if (mode === 'files') await transferFiles(metadata);
         else await api('/uploads.json', {
@@ -366,7 +366,7 @@ $('upload-form').addEventListener('submit', async (event) => {
         $('source-url').value = '';
         $('source').value = '';
         $('tags').value = '';
-        $('transfer-label').textContent = 'Received. Processing continues in the background.';
+        $('transfer-label').textContent = 'Done.';
         refresh();
     } catch (error) {
         $('upload-error').textContent = error.message;
@@ -404,13 +404,13 @@ async function refresh() {
                 }
                 const text = node('div', undefined, 'queue-text');
                 text.append(node('strong', item.filename || item.source_url || 'URL import'));
-                const message = item.error || (item.post_id ? `${item.duplicate ? 'Already in your collection' : 'Published'} · Post #${item.post_id}` : 'We’re getting it ready.');
+                const message = item.error || (item.post_id ? `${item.duplicate ? 'Already in your collection' : 'Uploaded'} · Post #${item.post_id}` : 'We’re getting it ready.');
                 text.append(node('small', message + (item.status === 'error' && !item.source_url ? ' Select the file again to re-upload.' : '')));
                 const labels = {
                     receiving: 'Receiving',
                     pending: 'Queued',
                     processing: 'Processing',
-                    completed: item.duplicate ? 'Duplicate' : 'Published',
+                    completed: item.duplicate ? 'Duplicate' : 'Uploaded',
                     error: 'Failed'
                 };
                 row.append(thumb, text, node('span', labels[item.status] || item.status, `state${item.status === 'error' ? ' failed' : ''}`));
