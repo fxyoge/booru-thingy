@@ -1,11 +1,15 @@
 # booru-thingy
 
-A small, single-user, headless booru backend built for **Boorusama**.
+A small, single-user, mostly-headless booru backend that implements part of the
+Danbooru API. Uses postgres + object storage (S3). Use your preferred client as
+the frontend.
 
-Keep a personal collection of images and videos, browse and edit it from your
-booru client, and add new finds through a focused, mobile-friendly upload page.
-Rust powers the application, PostgreSQL holds metadata, and S3-compatible object
-storage holds originals and previews.
+<details open>
+<summary><b>Screenshot</b></summary>
+
+![Screenshot of the upload page](screenshot.png)
+
+</details>
 
 ## Features
 
