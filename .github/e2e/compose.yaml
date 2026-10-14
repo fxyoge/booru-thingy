@@ -103,7 +103,7 @@ services:
     healthcheck: {disable: true}
 
   sources:
-    image: python:3.13.3-slim-bookworm@sha256:56a11364ffe0fee3bd60af6d6d5209eba8a99c2c16dc4c7c5861dc06261503cc
+    image: python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83
     command: ["python", "-u", "/source_server.py"]
     volumes: ["./source_server.py:/source_server.py:ro"]
     ports: ["127.0.0.1:8090:8000"]
