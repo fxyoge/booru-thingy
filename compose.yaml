@@ -21,7 +21,7 @@ services:
     tmpfs: ["/tmp:size=2g,uid=10001,gid=10001,mode=1777"]
 
   postgres:
-    image: postgres:17-bookworm
+    image: postgres:17-bookworm@sha256:3645570cccdfa447589da9f57dd740faa29b30938e861289a5574b6ca6b03826
     environment:
       POSTGRES_DB: booru
       POSTGRES_USER: booru
@@ -59,7 +59,7 @@ services:
     healthcheck: {disable: true}
 
   seaweedfs:
-    image: chrislusf/seaweedfs:4.48
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     # Bucket CORS alone does not constrain SeaweedFS's global preflight handler.
     command: mini -ip=seaweedfs -s3.port=9000 -s3.autoCreateBucket=false -s3.allowedOrigins=${BASE_URL:-http://localhost:8080} -admin.port=9001
     environment:
