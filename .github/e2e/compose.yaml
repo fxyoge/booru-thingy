@@ -56,7 +56,7 @@ services:
     healthcheck: {disable: true}
 
   postgres:
-    image: postgres:17-bookworm
+    image: postgres:17-bookworm@sha256:3645570cccdfa447589da9f57dd740faa29b30938e861289a5574b6ca6b03826
     environment:
       POSTGRES_DB: booru
       POSTGRES_USER: booru
@@ -69,7 +69,7 @@ services:
       retries: 30
 
   seaweedfs:
-    image: chrislusf/seaweedfs:4.48
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     command: mini -ip=seaweedfs -s3.port=9000 -s3.autoCreateBucket=false -s3.allowedOrigins=http://localhost:8080 -admin.port=9001
     environment:
       AWS_ACCESS_KEY_ID: local-access-key
@@ -103,7 +103,7 @@ services:
     healthcheck: {disable: true}
 
   sources:
-    image: python:3.13.3-slim-bookworm
+    image: python:3.13.3-slim-bookworm@sha256:56a11364ffe0fee3bd60af6d6d5209eba8a99c2c16dc4c7c5861dc06261503cc
     command: ["python", "-u", "/source_server.py"]
     volumes: ["./source_server.py:/source_server.py:ro"]
     ports: ["127.0.0.1:8090:8000"]

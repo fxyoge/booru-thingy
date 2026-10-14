@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17-bookworm
+        image: postgres:17-bookworm@sha256:3645570cccdfa447589da9f57dd740faa29b30938e861289a5574b6ca6b03826
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -29,17 +29,17 @@ jobs:
       TEST_S3_SECRET_KEY: local-secret-key
       CARGO_BUILD_JOBS: 2
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         persist-credentials: false
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
-    - uses: Swatinem/rust-cache@v2
-    - uses: sqlc-dev/setup-sqlc@v4
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+    - uses: sqlc-dev/setup-sqlc@c0209b9199cd1cce6a14fc27cabcec491b651761 # v4
       with:
         sqlc-version: '1.30.0'
-    - uses: extractions/setup-just@v3
+    - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
     - run: just check-sql
     - run: sudo apt-get update && sudo apt-get install -y ffmpeg libvips-tools
     - run: cargo fmt --check
@@ -57,11 +57,11 @@ jobs:
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         persist-credentials: false
-    - uses: docker/setup-buildx-action@v3
-    - uses: docker/metadata-action@v5
+    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+    - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
       id: meta
       with:
         images: ghcr.io/${{ github.repository }}
@@ -69,7 +69,7 @@ jobs:
           type=semver,pattern={{version}}
           type=semver,pattern={{major}}.{{minor}}
           type=raw,value=latest
-    - uses: docker/build-push-action@v6
+    - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
       with:
         context: .
         push: false
@@ -81,7 +81,7 @@ jobs:
     - run: docker run --rm booru-thingy:e2e --help
     - name: Export image for E2E jobs
       run: docker save --output "$RUNNER_TEMP/booru-image.tar" booru-thingy:e2e
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: e2e-image
         path: ${{ runner.temp }}/booru-image.tar
@@ -115,16 +115,16 @@ jobs:
       OWNER_LOGIN: owner
       OWNER_API_KEY: e2e-test-key
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         persist-credentials: false
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: '3.13'
         cache: pip
         cache-dependency-path: tests/e2e/requirements.txt
-    - uses: extractions/setup-just@v3
-    - uses: actions/download-artifact@v4
+    - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       with:
         name: e2e-image
         path: ${{ runner.temp }}/e2e-image
@@ -159,7 +159,7 @@ jobs:
         mkdir -p test-results
         docker compose logs --no-color > test-results/deployment.log 2>&1
         docker compose ps --all --format json > test-results/containers.json
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       if: always()
       with:
         name: e2e-results-${{ matrix.storage }}-${{ matrix.deployment }}
@@ -181,12 +181,12 @@ jobs:
       contents: read
       packages: write
     steps:
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       with:
         name: e2e-image
         path: ${{ runner.temp }}/e2e-image
     - run: docker load --input "$RUNNER_TEMP/e2e-image/booru-image.tar"
-    - uses: docker/login-action@v3
+    - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
