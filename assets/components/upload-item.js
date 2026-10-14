@@ -28,7 +28,7 @@ export function UploadItem({item: initial, onRefreshPreview}) {
         name.val = item.filename || item.source_url || 'URL import';
         const text = item.error || (item.post_id
             ? `${item.duplicate ? 'Already in your collection' : 'Uploaded'} · Post #${item.post_id}`
-            : 'We’re getting it ready.');
+            : 'Processing');
         message.val = text + (item.status === 'error' && !item.source_url ? ' Select the file again to re-upload.' : '');
         failed.val = item.status === 'error';
         status.val = item.status === 'completed' && item.duplicate ? 'Duplicate' : labels[item.status] || item.status;
