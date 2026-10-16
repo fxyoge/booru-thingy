@@ -39,7 +39,7 @@ jobs:
     - uses: sqlc-dev/setup-sqlc@c0209b9199cd1cce6a14fc27cabcec491b651761 # v4
       with:
         sqlc-version: '1.30.0'
-    - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+    - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
     - run: just check-sql
     - run: sudo apt-get update && sudo apt-get install -y ffmpeg libvips-tools
     - run: cargo fmt --check
@@ -123,7 +123,7 @@ jobs:
         python-version: '3.13'
         cache: pip
         cache-dependency-path: tests/e2e/requirements.txt
-    - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+    - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
     - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       with:
         name: e2e-image
