@@ -81,7 +81,7 @@ jobs:
     - run: docker run --rm booru-thingy:e2e --help
     - name: Export image for E2E jobs
       run: docker save --output "$RUNNER_TEMP/booru-image.tar" booru-thingy:e2e
-    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: e2e-image
         path: ${{ runner.temp }}/booru-image.tar
@@ -124,7 +124,7 @@ jobs:
         cache: pip
         cache-dependency-path: tests/e2e/requirements.txt
     - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
-    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: e2e-image
         path: ${{ runner.temp }}/e2e-image
@@ -159,7 +159,7 @@ jobs:
         mkdir -p test-results
         docker compose logs --no-color > test-results/deployment.log 2>&1
         docker compose ps --all --format json > test-results/containers.json
-    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       if: always()
       with:
         name: e2e-results-${{ matrix.storage }}-${{ matrix.deployment }}
@@ -181,7 +181,7 @@ jobs:
       contents: read
       packages: write
     steps:
-    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: e2e-image
         path: ${{ runner.temp }}/e2e-image
