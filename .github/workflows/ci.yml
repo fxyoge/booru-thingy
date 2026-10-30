@@ -20,7 +20,7 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U test -d test" --health-interval 5s --health-timeout 3s --health-retries 20
       s3:
-        image: motoserver/moto:5.2.4
+        image: motoserver/moto:5.2.4@sha256:120b1589c6df7e35d2092935f6ff724486bb2c4189d0e36ce795baba1400ffd2
         ports: [ '5000:5000' ]
     env:
       DATABASE_URL: postgres://test:test@localhost:5432/test
@@ -32,7 +32,7 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         persist-credentials: false
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       with:
         components: rustfmt, clippy
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
