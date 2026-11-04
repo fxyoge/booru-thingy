@@ -20,7 +20,7 @@ confique = { version = "0.4", features = ["toml"] }
 cron = "0.17"
 futures-util = "0.3"
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 include_dir = "0.7"
 md-5 = "0.10"
 rand = "0.10"
