@@ -21,7 +21,7 @@ services:
     tmpfs: ["/tmp:size=2g,uid=10001,gid=10001,mode=1777"]
 
   postgres:
-    image: postgres:17-bookworm@sha256:3645570cccdfa447589da9f57dd740faa29b30938e861289a5574b6ca6b03826
+    image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
     environment:
       POSTGRES_DB: booru
       POSTGRES_USER: booru
